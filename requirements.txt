@@ -1,4 +1,6 @@
 bittensor>=7.4.0
+substrate-interface
+wandb
 
 pandas
 matplotlib
