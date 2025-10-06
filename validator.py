@@ -6,8 +6,10 @@ import datetime
 import time
 import wandb
 from subprocess import Popen, PIPE
+from typing import Optional, Dict
 
 from substrateinterface import SubstrateInterface
+from metadata_manager import MetadataManager
 
 
 class Validator:
@@ -25,6 +27,14 @@ class Validator:
         # Set up auto update.
         self.last_update_check = datetime.datetime.now()
         self.update_check_interval = 60 * 60 * 24  # 24 hours
+        
+        # Set up metadata manager
+        self.metadata_manager = MetadataManager(
+            netuid=self.config.netuid,
+            network=self.config.subtensor.network,
+            state_file=f"validator_state_{self.config.netuid}.json"
+        )
+        self.metadata_manager.start()
         
         # Set up wandb.
         self.wandb_run = None
@@ -164,6 +174,14 @@ class Validator:
 
         self.last_update_check = datetime.datetime.now()
         return not self.is_git_latest()
+    
+    def get_miner_metadata(self, uid: int) -> Optional[str]:
+        """Get metadata for a specific miner UID."""
+        return self.metadata_manager.get_miner_metadata(uid)
+    
+    def get_all_miner_metadata(self) -> Dict[int, str]:
+        """Get all miner metadata."""
+        return self.metadata_manager.get_all_miner_metadata()
 
     def new_wandb_run(self):
         """Creates a new wandb run to save information to."""
@@ -291,8 +309,14 @@ class Validator:
 
             except KeyboardInterrupt:
                 bt.logging.success("Keyboard interrupt detected. Exiting validator.")
+                self.metadata_manager.stop()
                 exit()
 
+            # Log metadata manager stats every 10 minutes
+            if minutes % 10 == 0:
+                stats = self.metadata_manager.get_stats()
+                bt.logging.info(f"Metadata Manager Stats: {stats}")
+            
             # sleep for 1 minute before checking again
             time.sleep(60)
 
