@@ -1,16 +1,19 @@
 import os
 import argparse
-import traceback
 import bittensor as bt
+import traceback
 import datetime
 import time
 import wandb
-from subprocess import Popen, PIPE
+import json
 from typing import Optional, Dict
-
+import requests
+from requests.auth import HTTPBasicAuth
+from subprocess import Popen, PIPE
 from substrateinterface import SubstrateInterface
-from metadata_manager import MetadataManager
 
+from metadata_manager import MetadataManager
+from scoring import score_miners
 
 class Validator:
     def __init__(self):
@@ -23,6 +26,11 @@ class Validator:
         self.tempo = self.node_query('SubtensorModule', 'Tempo', [self.config.netuid])
         self.moving_avg_scores = [1.0] * len(self.metagraph.S)
         self.alpha = 0.1
+
+        self.trading_history_endpoint = "https://almanac.market/api/trading_history"
+        if self.config.subtensor.network == "test":
+            self.trading_history_endpoint = "https://test.almanac.market/api/trading_history"
+        self.rolling_history_in_days = 30
 
         # Set up auto update.
         self.last_update_check = datetime.datetime.now()
@@ -205,63 +213,78 @@ class Validator:
         )
         bt.logging.debug(f"Started a new wandb run: {name}")
 
+    def fetch_trading_history(self) -> Dict:
+        if self.config.subtensor.network == "test":
+            # Let's load in synthetic data for now
+            with open("tests/mock_trading_data.json", "r") as f:
+                return json.load(f)
+
+        else:
+            bt.logging.info(f"Fetching trading history from {self.trading_history_endpoint} for {self.rolling_history_in_days} days")        
+            url = f"{self.trading_history_endpoint}?days={self.rolling_history_in_days}"
+            
+            keypair = self.dendrite.keypair
+            hotkey = keypair.ss58_address
+            signature = f"0x{keypair.sign(hotkey).hex()}"
+
+            response = requests.get(
+                url, 
+                auth=HTTPBasicAuth(hotkey, signature),
+                timeout=10
+            )
+            response.raise_for_status()
+            return response.json()
+
     def run(self):
         # The Main Validation Loop.
-        bt.logging.info("=========== STARTING SN41 VALIDATOR ===========")
+        bt.logging.info("=========== STARTING SN41 VALIDATOR LOOP ===========")
         while True:
             current_time = datetime.datetime.utcnow()
             minutes = current_time.minute
-            hour = current_time.hour
 
             # Get the current block number and the last update time.
             try:
-                self.current_block = self.node_query('System', 'Number', [])
-                last_update_data = self.node_query('SubtensorModule', 'LastUpdate', [self.config.netuid])
+                should_score_and_set_weights = False
+                # Score and set weights every hour on the hour
+                if minutes == 0:
+                    should_score_and_set_weights = True
                 
-                # Check if we have validator permit and stake
-                """
-                try:
-                    validator_permit = self.node_query('SubtensorModule', 'ValidatorPermit', [self.config.netuid])
-                    if isinstance(validator_permit, list) and len(validator_permit) > self.my_uid:
-                        permit_status = validator_permit[self.my_uid]
-                        bt.logging.info(f"Validator permit: {permit_status}")
-                    else:
-                        bt.logging.warning(f"Could not get validator permit for UID {self.my_uid}")
-                except Exception as e:
-                    bt.logging.warning(f"Could not query validator permit: {e}")
-                """
-                
-                if isinstance(last_update_data, list) and len(last_update_data) > self.my_uid:
-                    last_update_block = last_update_data[self.my_uid]
-                    self.last_update = self.current_block - last_update_block
-                    #bt.logging.debug(f"Last weight submission was {last_update_block} blocks ago (block {last_update_block})")
-                elif isinstance(last_update_data, list) and len(last_update_data) == 0:
-                    # New validator - no LastUpdate data yet
-                    self.last_update = 0
-                    bt.logging.info(f"🆕 New validator detected! No previous weight submissions found.")
-                    bt.logging.info(f"Ready to submit weights when tempo ({self.tempo + 1}) blocks have passed.")
-                else:
-                    # Unexpected data format or UID not found
-                    self.last_update = 0
-                    bt.logging.warning(f"⚠️  Unexpected LastUpdate data format for UID {self.my_uid}: {last_update_data}")
-                    bt.logging.warning(f"Treating as new validator. Will be ready to submit weights in {self.tempo + 1} blocks.")
+                if should_score_and_set_weights:
+                    all_uids = self.metagraph.uids.tolist()
+                    all_hotkeys = self.metagraph.hotkeys.tolist()
 
-                # set weights once every tempo + 1, or immediately for new validators
-                if self.last_update == 0:
-                    # New validator - submit weights immediately
-                    should_set_weights = True
-                    bt.logging.info(f"🆕 New validator: Submitting initial weights immediately!")
-                else:
-                    # Existing validator - wait for tempo + 1 blocks since last update
-                    should_set_weights = self.last_update > self.tempo + 1
-                
-                if should_set_weights:
+                    # Fetch the trading history
+                    trading_history = self.fetch_trading_history()
+
+                    # Score the miners
+                    miners_profiles, miners_scores, general_pool_scores, miner_pool_epoch_budget, general_pool_epoch_budget = score_miners(all_uids, all_hotkeys, trading_history)
+
+                    # Validate the miner profiles
+                    for miner_id in miners_profiles:
+                        if miners_profiles[miner_id] is None:
+                            bt.logging.error(f"❌ Miner {miner_id} has no profile id defined. This should never happen. Setting score to 0.")
+                            miners_scores[miner_id] = 0
+                            continue
+                        
+                        # Get and check the miner metadata from the metadata manager
+                        miner_metadata = self.get_miner_metadata(miner_id)
+                        if miner_metadata is None or miner_metadata["polymarket_id"] is None:
+                            bt.logging.warning(f"❌ Miner {miner_id} has no metadata defined. Setting score to 0.")
+                            miners_scores[miner_id] = 0
+                            continue
+                        
+                        # Check if the miner profile id contains the metadata polymarket id as we only save partial polymarket ids to the blockchain
+                        if miner_metadata["polymarket_id"] not in miners_profiles[miner_id]:
+                            bt.logging.warning(f"❌ Miner {miner_id} polymarket ids do not match. {miner_metadata['polymarket_id']} not found in profile id. Setting score to 0.")
+                            miners_scores[miner_id] = 0
+                            continue
+                    
+
+                    # @TODO: Replace this with the actual weights from the scoring function
                     total = sum(self.moving_avg_scores)
                     weights = [score / total for score in self.moving_avg_scores]
-                    if self.last_update == 0:
-                        bt.logging.info(f"🎉 Setting initial weights: {weights}")
-                    else:
-                        bt.logging.info(f"Setting weights: {weights}")
+
+                    bt.logging.info(f"Setting weights: {weights}")
                     
                     # Update the incentive mechanism weights on the Bittensor blockchain.
                     bt.logging.info(f"Submitting weights to subnet {self.config.netuid}...")
@@ -298,10 +321,8 @@ class Validator:
                             self.new_wandb_run()
 
                     # Only log an update periodically
-                    if self.last_update == 0:
-                        bt.logging.info(f"🆕 New validator: Will submit initial weights next cycle.")
-                    elif minutes % 2 == 0:
-                            bt.logging.info(f"Last update: {self.last_update} blocks ago. ~{self.tempo + 1 - self.last_update} blocks until setting weights.")
+                    if minutes % 5 == 0:
+                        bt.logging.info(f"Not time to score and set weights. Waiting for next hour.")
 
             except RuntimeError as e:
                 bt.logging.error(e)

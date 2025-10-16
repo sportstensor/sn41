@@ -6,3 +6,6 @@ pandas
 matplotlib
 tabulate
 requests
+
+cvxpy
+ecos
