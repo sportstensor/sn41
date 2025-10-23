@@ -84,7 +84,7 @@ from collections import defaultdict
 from typing import Dict, Any, List
 from datetime import datetime, timedelta, timezone
 from constants import (
-  ROLLING_WINDOW_IN_DAYS,
+  ROLLING_HISTORY_IN_DAYS,
   ROI_MIN,
   VOLUME_MIN,
   VOLUME_FEE,
@@ -92,16 +92,15 @@ from constants import (
   RAMP,
   RHO_CAP,
   KAPPA_NEXT,
+  KAPPA_SCALING_FACTOR,
   GENERAL_POOL_WEIGHT_PERCENTAGE,
   MINER_WEIGHT_PERCENTAGE,
   MIN_EPOCHS_FOR_ELIGIBILITY,
-  MIN_TRADES_FOR_ELIGIBILITY,
+  MIN_PREDICTIONS_FOR_ELIGIBILITY,
   MIN_ACTIVE_EPOCHS,
   BURN_UID,
   EXCESS_MINER_WEIGHT_UID,
   EXCESS_MINER_MIN_WEIGHT,
-  TOTAL_MINER_ALPHA_PER_DAY,
-  EPOCH_DISTRIBUTION_COUNT,
 )
 
 def score_miners(
@@ -188,6 +187,7 @@ def score_miners(
         max_fees_weighted=miner_pool_epoch_fees,
         roi_min=ROI_MIN,
         volume_min=VOLUME_MIN,
+        require_epoch_preds=False,
         verbose=verbose
     )
     
@@ -198,6 +198,7 @@ def score_miners(
         max_fees_weighted=general_pool_epoch_fees,
         roi_min=ROI_MIN,
         volume_min=VOLUME_MIN,
+        require_epoch_preds=True,
         verbose=verbose
     )
 
@@ -226,7 +227,7 @@ def build_epoch_history(
     """
     # Determine date range and number of epochs
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    start_date = today - timedelta(days=ROLLING_WINDOW_IN_DAYS)
+    start_date = today - timedelta(days=ROLLING_HISTORY_IN_DAYS)
     
     # Determine number of epochs based on target_epoch_idx
     if target_epoch_idx is not None:
@@ -234,7 +235,7 @@ def build_epoch_history(
         n_epochs = target_epoch_idx + 1
     else:
         # For current epoch: use full rolling window (default behavior)
-        n_epochs = ROLLING_WINDOW_IN_DAYS
+        n_epochs = ROLLING_HISTORY_IN_DAYS
     
     # Create list of epoch dates (0 = oldest, n_epochs-1 = most recent)
     epoch_dates = [(start_date + timedelta(days=i)).date() for i in range(n_epochs)]
@@ -367,7 +368,7 @@ def check_build_up_eligibility(epoch_history: Dict[str, Any]) -> np.ndarray:
             
         # Check minimum trades requirement
         total_trades = np.sum(trade_counts[:, entity_idx])
-        if total_trades < MIN_TRADES_FOR_ELIGIBILITY:
+        if total_trades < MIN_PREDICTIONS_FOR_ELIGIBILITY:
             eligible[entity_idx] = False
             continue
             
@@ -386,6 +387,7 @@ def score_with_epochs(
     roi_min: float,
     volume_min: float,
     max_fees_weighted: float,
+    require_epoch_preds: bool = False,
     verbose: bool = True
 ):
     """
@@ -443,7 +445,7 @@ def score_with_epochs(
         n_build_up_eligible = np.sum(build_up_eligible)
         print(f"Build-up eligibility: {n_build_up_eligible}/{n_entities} entities meet build-up requirements")
         print(f"  - MIN_EPOCHS_FOR_ELIGIBILITY: {MIN_EPOCHS_FOR_ELIGIBILITY}")
-        print(f"  - MIN_TRADES_FOR_ELIGIBILITY: {MIN_TRADES_FOR_ELIGIBILITY}")
+        print(f"  - MIN_TRADES_FOR_ELIGIBILITY: {MIN_PREDICTIONS_FOR_ELIGIBILITY}")
         print(f"  - MIN_ACTIVE_EPOCHS: {MIN_ACTIVE_EPOCHS}")
     
     # Combine all eligibility requirements
@@ -518,7 +520,8 @@ def score_with_epochs(
         "x_prev": x_prev,                          # allocations this epoch. @TODO: verify with Stephen (currently not in use)
         "kappa_bar": kappa_bar,                    # payout rate
         "ramp": RAMP,                              # allocation delta rate
-        "rho_cap": RHO_CAP                         # max allocation per miner
+        "rho_cap": RHO_CAP,                        # max allocation per miner
+        "require_epoch_preds": require_epoch_preds  # require current epoch predictions toggle
     }
     
     """
@@ -697,24 +700,26 @@ def solve_phase1(p, verbose=False):
         # Fallback: assume all are eligible if no epoch history provided
         build_up_eligible = np.ones(len(roi_trailing), dtype=bool)
     
-    eligible = (
-        (roi_trailing >= p["roi_min"]) & 
-        (v_memory >= p["v_min"]) &
-        build_up_eligible
-    ).astype(float)
+    # require_epoch_preds: If True, require current epoch predictions (v_block) for eligibility
+    require_epoch_preds = p.get("require_epoch_preds", False)
+    if require_epoch_preds:
+        # Require current epoch predictions - use v_block (total volume this epoch)
+        eligible = (
+            (roi_trailing >= p["roi_min"]) & 
+            (v_block >= p["v_min"]) &
+            build_up_eligible
+        ).astype(float)
+    else:
+        # Use decaying volume memory - only use v_memory (historical volume with decay)
+        eligible = (
+            (roi_trailing >= p["roi_min"]) & 
+            (v_memory >= p["v_min"]) &
+            build_up_eligible
+        ).astype(float)
 
     if verbose:
         print({"kappa": kappa})
         print({"roi_trailing": roi_trailing*eligible})
- 
-    #########################################
-    ## Get the number of Eligible uids
-    ## Not everyone bets in an epoch so we have
-    ## to shutdown the budget if people simply
-    ## do not bet.
-    #########################################
-    N_total = len(v_prev)
-    N_eligible = int(np.sum(eligible))
  
     # 3) Decision variable
     x = cp.Variable(n)
@@ -817,12 +822,23 @@ def solve_phase2(p, x1, T1, verbose=False):
     else:
         # Fallback: assume all are eligible if no epoch history provided
         build_up_eligible = np.ones(len(roi), dtype=bool)
-    
-    eligible = (
-        (roi >= p["roi_min"]) & 
-        (v_eff >= p["v_min"]) &
-        build_up_eligible
-    ).astype(float)
+
+    # require_epoch_preds: If True, require current epoch predictions (v_block) for eligibility
+    require_epoch_preds = p.get("require_epoch_preds", False)
+    if require_epoch_preds:
+        # Require current epoch predictions - use v_block (total volume this epoch)
+        eligible = (
+            (roi >= p["roi_min"]) & 
+            (v >= p["v_min"]) &
+            build_up_eligible
+        ).astype(float)
+    else:
+        # Use decaying volume memory - only use v_eff (historical volume with decay)
+        eligible = (
+            (roi >= p["roi_min"]) & 
+            (v_eff >= p["v_min"]) &
+            build_up_eligible
+        ).astype(float)
 
     # Total payout from Phase 1 (fixed)
     P1 = float(np.dot(c, x1))
@@ -847,6 +863,7 @@ def solve_phase2(p, x1, T1, verbose=False):
     roi_spread = np.std(p["roi_trailing"])
     vol_mean   = np.mean(p["v_eff"])
 
+    # dynamic smoothness penalty λ. higher value means more smoothness, less volatility.
     lam = 5
 
     if verbose:
@@ -880,7 +897,7 @@ Purpose: Computes the value of kappa as an endogenous variable that depends
             on previous volume and roi.  The goal is to restrict the payout rate
             of the budget by setting the “exchange rate” between qualified flow and token budget.
 """
-def compute_joint_kappa_from_history(epoch_history: Dict[str, Any], lookback=ROLLING_WINDOW_IN_DAYS, smooth=0.3, fee_rate=VOLUME_FEE, kappa_next=KAPPA_NEXT, joint_kappa=None) -> float:
+def compute_joint_kappa_from_history(epoch_history: Dict[str, Any], lookback=ROLLING_HISTORY_IN_DAYS, smooth=0.3, fee_rate=VOLUME_FEE, kappa_next=KAPPA_NEXT, joint_kappa=None) -> float:
     """
     Compute kappa_bar from epoch history matrices.
     
@@ -916,8 +933,8 @@ def compute_joint_kappa_from_history(epoch_history: Dict[str, Any], lookback=ROL
     # light smoothing, no target constants
     prior = joint_kappa if joint_kappa is not None else kappa_stat
     joint_kappa = (1.0 - smooth) * prior + smooth * kappa_stat
-
-    return max(joint_kappa, 1e-12)/6
+    
+    return max(joint_kappa, 1e-12)/KAPPA_SCALING_FACTOR
 
 def print_pool_stats(miner_history, general_pool_history, include_current_epoch=False, miner_scores=None, general_pool_scores=None):
     """Print historical stats for both pools."""
@@ -1074,10 +1091,10 @@ def calculate_weights(miners_scores: Dict[str, Any], general_pool_scores: Dict[s
     """
     ### Calculate proper weight allocation for the epoch ###
     # Step 1: Calculate individual miner weights as percentage of total budget
-    miner_tokens_allocated = miners_scores['tokens']
-    miner_entity_ids = miners_scores['entity_ids']
-    general_pool_tokens_allocated = general_pool_scores['tokens']
-    general_pool_entity_ids = general_pool_scores['entity_ids']
+    miner_tokens_allocated = miners_scores['tokens'] if 'tokens' in miners_scores else np.zeros(len(miners_scores['entity_ids']))
+    miner_entity_ids = miners_scores['entity_ids'] if 'entity_ids' in miners_scores else []
+    general_pool_tokens_allocated = general_pool_scores['tokens'] if 'tokens' in general_pool_scores else np.zeros(len(general_pool_scores['entity_ids']))
+    general_pool_entity_ids = general_pool_scores['entity_ids'] if 'entity_ids' in general_pool_scores else []
     
     # Calculate total subnet budget for normalization
     total_epoch_budget = current_epoch_budget
@@ -1108,12 +1125,14 @@ def calculate_weights(miners_scores: Dict[str, Any], general_pool_scores: Dict[s
     #bt.logging.info(f"Miner pool total epoch units: {total_miner_pool_tokens:,.2f}")
     print(f"Miner pool total epoch units: {total_miner_pool_tokens:,.2f}")
 
-    # Step 2: Calculate general pool total weight and assign to BURN_UID
+    # Step 2: Calculate general pool total weight and assign to BURN_UID. It is always GENERAL_POOL_WEIGHT_PERCENTAGE of the total epoch budget.
     total_general_pool_tokens = np.sum(general_pool_tokens_allocated)
-    general_pool_weight = total_general_pool_tokens / total_epoch_budget
+    general_pool_weight = (GENERAL_POOL_WEIGHT_PERCENTAGE * total_epoch_budget) / total_epoch_budget
     miner_weights[BURN_UID] = general_pool_weight
-    #bt.logging.info(f"General pool total epoch units: {total_general_pool_tokens:,.2f}, BURN_UID weight: {general_pool_weight:.4f}")
-    print(f"General pool total epoch units: {total_general_pool_tokens:,.2f} (BURN_UID weight: {general_pool_weight:.4f})")
+    #bt.logging.info(f"General pool total epoch units: {total_general_pool_tokens:,.2f}")
+    #bt.logging.info(f"General pool BURN_UID weight: {general_pool_weight:.4f} (always {GENERAL_POOL_WEIGHT_PERCENTAGE * 100:.2f}% of total epoch budget)")
+    print(f"General pool total epoch units: {total_general_pool_tokens:,.2f}")
+    print(f"General pool BURN_UID weight: {general_pool_weight:.4f} (always {GENERAL_POOL_WEIGHT_PERCENTAGE * 100:.2f}% of total epoch budget)")
 
     # Step 3: Calculate total allocated weight and excess
     total_allocated_weight = sum(miner_weights.values())
@@ -1132,9 +1151,10 @@ def calculate_weights(miners_scores: Dict[str, Any], general_pool_scores: Dict[s
     weights = []
     for uid in all_uids:
         if uid in miner_weights:
-            # Divide the weight by the number of epochs per day to get the average weight per epoch
+            # Use the full weight (not divided by epoch count)
+            # The epoch distribution happens automatically over 20 epochs
             if miner_weights[uid] > 0:
-                weights.append(miner_weights[uid] / EPOCH_DISTRIBUTION_COUNT)
+                weights.append(miner_weights[uid])
             else:
                 weights.append(0.0)
         else:
@@ -1142,9 +1162,9 @@ def calculate_weights(miners_scores: Dict[str, Any], general_pool_scores: Dict[s
             weights.append(0.0)
     
     # Normalize weights to ensure they sum to 1.0
-    #total_weight = sum(weights)
-    #if total_weight > 0:
-    #    weights = [w / total_weight for w in weights]
+    total_weight = sum(weights)
+    if total_weight > 0:
+        weights = [w / total_weight for w in weights]
     
     bt.logging.info(f"Setting weights: {weights}")
     bt.logging.info(f"Total weight sum: {sum(weights):.6f}")

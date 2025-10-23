@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import bittensor as bt
 
 from scoring import score_miners, calculate_weights, print_pool_stats
-from constants import MINER_WEIGHT_PERCENTAGE, GENERAL_POOL_WEIGHT_PERCENTAGE, ROLLING_WINDOW_IN_DAYS, KAPPA_NEXT, TOTAL_MINER_ALPHA_PER_DAY, EXCESS_MINER_WEIGHT_UID, BURN_UID
+from constants import MINER_WEIGHT_PERCENTAGE, GENERAL_POOL_WEIGHT_PERCENTAGE, ROLLING_HISTORY_IN_DAYS, KAPPA_NEXT, TOTAL_MINER_ALPHA_PER_DAY, EXCESS_MINER_WEIGHT_UID, BURN_UID
 
 
 def load_mock_data(filepath="tests/mock_trading_data.json"):
@@ -128,8 +128,8 @@ def calculate_historical_payouts(miner_history, general_pool_history, all_uids, 
                 if debug:
                     print(f"  -> MP budget: ${epoch_mp_budget:.2f}, GP budget: ${epoch_gp_budget:.2f}")
                 
-                mp_payout = np.sum(epoch_miners_scores['tokens'])
-                gp_payout = np.sum(epoch_gp_scores['tokens'])
+                mp_payout = np.sum(epoch_miners_scores['tokens']) if 'tokens' in epoch_miners_scores else 0.0
+                gp_payout = np.sum(epoch_gp_scores['tokens']) if 'tokens' in epoch_gp_scores else 0.0
                 
                 # Debug info
                 if debug:
@@ -258,13 +258,14 @@ def create_daily_stats_table(miner_history, general_pool_history, miners_scores=
         
         # Get payouts for this epoch
         if epoch_idx == n_epochs - 1:
+            mp_payouts = 0.0
+            gp_payouts = 0.0
             # Current epoch (most recent) - use provided payouts
             if miners_scores is not None and general_pool_scores is not None:
-                mp_payouts = np.sum(miners_scores['tokens'])
-                gp_payouts = np.sum(general_pool_scores['tokens'])
-            else:
-                mp_payouts = 0.0
-                gp_payouts = 0.0
+                if 'tokens' in miners_scores:
+                    mp_payouts = np.sum(miners_scores['tokens'])
+                if 'tokens' in general_pool_scores:
+                    gp_payouts = np.sum(general_pool_scores['tokens'])
         else:
             # Historical epochs - use pre-calculated payouts
             if historical_mp_payouts is not None and historical_gp_payouts is not None:
@@ -354,7 +355,7 @@ def print_results(miner_history, general_pool_history, miners_scores, general_po
     print("="*80)
     
     # Daily stats table
-    print(f"\n--- DAILY STATS (Last {ROLLING_WINDOW_IN_DAYS} Epochs) ---")
+    print(f"\n--- DAILY STATS (Last {ROLLING_HISTORY_IN_DAYS} Epochs) ---")
     daily_stats = create_daily_stats_table(
         miner_history, 
         general_pool_history, 
@@ -442,8 +443,8 @@ def print_results(miner_history, general_pool_history, miners_scores, general_po
     
     # Summary statistics
     print("\n--- SUMMARY STATISTICS ---")
-    total_miner_payout = np.sum(miners_scores['tokens'])
-    total_gp_payout = np.sum(general_pool_scores['tokens'])
+    total_miner_payout = np.sum(miners_scores['tokens']) if 'tokens' in miners_scores else 0.0
+    total_gp_payout = np.sum(general_pool_scores['tokens']) if 'tokens' in general_pool_scores else 0.0
     print(f"Total Miner Payouts:      ${total_miner_payout:,.2f}")
     print(f"Total GP Payouts:         ${total_gp_payout:,.2f}")
     print(f"Total Payouts:            ${total_miner_payout + total_gp_payout:,.2f}")
@@ -464,7 +465,7 @@ def main():
     print("Loading mock trading data...")
     
     # Load the mock data
-    trading_history = load_mock_data()
+    trading_history = load_mock_data('tests/advanced_mock_data.json')
     print(f"Loaded {len(trading_history)} trades")
     
     # Extract miner information

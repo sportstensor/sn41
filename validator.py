@@ -144,9 +144,9 @@ class Validator:
             bt.logging.info(f"Running validator on uid: {self.my_uid}")
 
         # Set up initial scoring weights for validation.
-        bt.logging.info("Building validation weights.")
-        self.scores = [1.0] * len(self.metagraph.S)
-        bt.logging.info(f"Weights: {self.scores}")
+        bt.logging.info("Building initial validation weights.")
+        self.scores = [0] * len(self.metagraph.S)
+        #bt.logging.info(f"Weights: {self.scores}")
 
     def node_query(self, module, method, params):
         try:
@@ -284,6 +284,11 @@ class Validator:
                 # Score and set weights every hour on the hour
                 if minutes == 0:
                     should_score_and_set_weights = True
+
+                # If metadata manager last full sync is more than 2 hours ago, skip scoring and setting weights
+                if self.metadata_manager.last_full_sync < current_time - datetime.timedelta(hours=2) and self.config.subtensor.network != "test":
+                    bt.logging.info("Metadata manager last full sync is more than 2 hours ago. Skipping scoring and setting weights.")
+                    should_score_and_set_weights = False
                 
                 if should_score_and_set_weights:
                     # Sync our validator with the metagraph so we have the latest information
@@ -328,37 +333,39 @@ class Validator:
                     # Validate the miner profiles
                     miner_profiles = {}
                     miners_to_penalize = []
-                    if 'miner_profiles' in miner_history:
-                        miner_profiles = miner_history['miner_profiles']
-                    for miner_uid in miner_profiles.keys():
-                        if miner_profiles[miner_uid] is None:
-                            bt.logging.error(f"❌ Miner {miner_uid} has no profile id defined. This should never happen. Setting score to 0.")
-                            miners_to_penalize.append(miner_uid)
-                            continue
-                        if "," in miner_profiles[miner_uid]:
-                            bt.logging.warning(f"❌ Miner {miner_uid} has multiple profile ids defined. {miner_profiles[miner_uid]}. This should never happen. Setting score to 0.")
-                            miners_to_penalize.append(miner_uid)
-                            continue
-                        
-                        # Get and check the miner metadata from the metadata manager
-                        miner_metadata = self.get_miner_metadata(miner_uid)
-                        if miner_metadata is None or miner_metadata["polymarket_id"] is None:
-                            bt.logging.warning(f"❌ Miner {miner_uid} has no metadata defined. Setting score to 0.")
-                            miners_to_penalize.append(miner_uid)
-                            continue
-                        
-                        # Check if the miner profile id contains the metadata polymarket id as we only save partial polymarket ids to the blockchain
-                        if miner_metadata["polymarket_id"] not in miner_profiles[miner_uid]:
-                            bt.logging.warning(f"❌ Miner {miner_uid} polymarket ids do not match. {miner_metadata['polymarket_id']} not found in profile id. Setting score to 0.")
-                            miners_to_penalize.append(miner_uid)
-                            continue
+                    if self.config.subtensor.network != "test":
+                        if 'miner_profiles' in miner_history:
+                            miner_profiles = miner_history['miner_profiles']
+                        for miner_uid in miner_profiles.keys():
+                            if miner_profiles[miner_uid] is None:
+                                bt.logging.error(f"❌ Miner {miner_uid} has no profile id defined. This should never happen. Setting score to 0.")
+                                miners_to_penalize.append(miner_uid)
+                                continue
+                            if "," in miner_profiles[miner_uid]:
+                                bt.logging.warning(f"❌ Miner {miner_uid} has multiple profile ids defined. {miner_profiles[miner_uid]}. This should never happen. Setting score to 0.")
+                                miners_to_penalize.append(miner_uid)
+                                continue
+                            
+                            # Get and check the miner metadata from the metadata manager
+                            miner_metadata = self.get_miner_metadata(miner_uid)
+                            if miner_metadata is None or miner_metadata["polymarket_id"] is None:
+                                bt.logging.warning(f"❌ Miner {miner_uid} has no metadata defined. Setting score to 0.")
+                                miners_to_penalize.append(miner_uid)
+                                continue
+                            
+                            # Check if the miner profile id contains the metadata polymarket id as we only save partial polymarket ids to the blockchain
+                            if miner_metadata["polymarket_id"] not in miner_profiles[miner_uid]:
+                                bt.logging.warning(f"❌ Miner {miner_uid} polymarket ids do not match. {miner_metadata['polymarket_id']} not found in profile id. Setting score to 0.")
+                                miners_to_penalize.append(miner_uid)
+                                continue
 
-                        # Log success -- do not log the actual polymarket id for privacy
-                        bt.logging.success(f"✅ UID {miner_uid}: Almanac polymarket id matches Bittensor chain metadata polymarket id.")
+                            # Log success -- do not log the actual polymarket id for privacy
+                            bt.logging.success(f"✅ UID {miner_uid}: Almanac polymarket id matches Bittensor chain metadata polymarket id.")
                     
 
                     # Calculate the weights for the miners and general pool
                     weights = calculate_weights(miners_scores, general_pool_scores, current_epoch_budget, miners_to_penalize, all_uids)
+                    self.scores = weights
                     
                     # Update the incentive mechanism weights on the Bittensor blockchain.
                     bt.logging.info(f"Submitting weights to subnet {self.config.netuid}...")
