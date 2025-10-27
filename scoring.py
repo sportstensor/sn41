@@ -145,7 +145,8 @@ def score_miners(
         "is_settled":true,
         "date_settled":"2025-07-25",
         "trade_type":"buy",
-        "price":0.5
+        "price":0.5,
+        "is_reward_eligible":true
     }
     """
 
@@ -270,7 +271,7 @@ def build_epoch_history(
             if miner_id is None or miner_hotkey is None:
                 continue
             # Validate: miner_id exists, has a registered hotkey, and hotkey matches
-            if miner_id not in all_uids or miner_id not in all_hotkeys or all_hotkeys[miner_id] != miner_hotkey:
+            if miner_id not in all_uids or miner_id >= len(all_hotkeys) or all_hotkeys[miner_id] != miner_hotkey:
                 continue
             entity_id = miner_id
             if miner_id not in miner_profiles:
@@ -313,22 +314,25 @@ def build_epoch_history(
             volume = trade["volume"]
             pnl = trade["pnl"]
             is_correct = trade["is_correct"]
+            is_reward_eligible = trade["is_reward_eligible"]
             
             # Calculate metrics (matching simulate_epochs.py logic)
             fee = volume * VOLUME_FEE
-            
-            volume_prev[epoch_idx, col_idx] += volume
-            if is_correct:
-                # Winning trade: qualified volume (after fee deduction) -- @TODO: verify with Stephen
-                qualified = volume * (1.0 - VOLUME_FEE)
-                qualified_prev[epoch_idx, col_idx] += qualified
-            else:
-                # Losing trade: unqualified volume
-                unqualified_prev[epoch_idx, col_idx] += volume
-            
-            profit_prev[epoch_idx, col_idx] += pnl
+            # Always collect fees for all trades, even if the trade is not reward eligible
             fees_prev[epoch_idx, col_idx] += fee
-            trade_counts[epoch_idx, col_idx] += 1  # Count each trade
+            
+            if is_reward_eligible:
+                volume_prev[epoch_idx, col_idx] += volume
+                if is_correct:
+                    # Winning trade: qualified volume (after fee deduction) -- @TODO: verify with Stephen
+                    qualified = volume * (1.0 - VOLUME_FEE)
+                    qualified_prev[epoch_idx, col_idx] += qualified
+                else:
+                    # Losing trade: unqualified volume
+                    unqualified_prev[epoch_idx, col_idx] += volume
+                
+                profit_prev[epoch_idx, col_idx] += pnl
+                trade_counts[epoch_idx, col_idx] += 1  # Count each trade
     
     return {
         "volume_prev": volume_prev,
@@ -1112,13 +1116,15 @@ def calculate_weights(miners_scores: Dict[str, Any], general_pool_scores: Dict[s
         
         # If the miner is in the list to penalize, set the weight to 0
         if miner_uid in miners_to_penalize:
-            bt.logging.info(f"Miner {miner_uid} failed validation. Tokens lost: {miner_tokens:,.2f}. Setting weight to 0.")
+            #bt.logging.info(f"Miner {miner_uid} failed validation. Tokens lost: {miner_tokens:,.2f}. Setting weight to 0.")
+            print(f"Miner {miner_uid} failed validation. Tokens lost: {miner_tokens:,.2f}. Setting weight to 0.")
             miner_weights[miner_uid] = 0
             continue
         
         # Calculate weight as percentage of total epoch budget
         miner_weight = miner_tokens / total_epoch_budget
-        bt.logging.info(f"Miner {miner_uid} tokens allocated: {miner_tokens:,.2f}, weight: {miner_weight:.4f}")
+        #bt.logging.info(f"Miner {miner_uid} tokens allocated: {miner_tokens:,.2f}, weight: {miner_weight:.4f}")
+        #print(f"Miner {miner_uid} tokens allocated: {miner_tokens:,.2f}, weight: {miner_weight:.4f}")
         miner_weights[miner_uid] = miner_weight
     
     total_miner_pool_tokens = np.sum(miner_tokens_allocated)

@@ -48,7 +48,8 @@ class Validator:
             network=self.config.subtensor.network,
             state_file=f"validator_state_{self.config.netuid}.json"
         )
-        self.metadata_manager.start()
+        if not self.config.metadata_manager.off:
+            self.metadata_manager.start()
         
         # Set up wandb.
         self.wandb_run = None
@@ -78,8 +79,6 @@ class Validator:
     def get_config(self):
         # Set up the configuration parser.
         parser = argparse.ArgumentParser()
-        # TODO: Add your custom validator arguments to the parser.
-        #parser.add_argument('--custom', default='my_custom_value', help='Adds a custom value to the parser.')
         # Adds override arguments for network and netuid.
         parser.add_argument('--netuid', type=int, default=1, help="The chain subnet uid.")
         # Adds subtensor specific arguments.
@@ -92,6 +91,8 @@ class Validator:
         parser.add_argument('--wandb.off', action='store_true', help="Disable wandb logging.")
         # Adds auto-update arguments.
         parser.add_argument('--auto_update', action='store_true', help="Enable auto-update of the validator.")
+        # Adds metadata manager arguments.
+        parser.add_argument('--metadata_manager.off', action='store_true', help="Disable metadata manager.")
         # Parse the config.
         config = bt.config(parser)
         # Set up logging directory.
@@ -240,8 +241,19 @@ class Validator:
         def _fetch():
             if self.config.subtensor.network == "test":
                 # Let's load in synthetic data for now
-                with open("tests/mock_trading_data.json", "r") as f:
-                    return json.load(f)
+                with open("tests/advanced_mock_data.json", "r") as f:
+                    trading_history = json.load(f)
+
+                # we need to look through the trading history and replace all the hotkeys with the actual hotkeys based on the uid
+                for trade in trading_history:
+                    if trade['miner_id'] == 170:
+                        trade['miner_id'] = 17
+                    if trade['miner_id'] is not None and trade['miner_id'] < len(self.metagraph.hotkeys) and trade['is_general_pool'] is False:
+                        trade['miner_hotkey'] = self.metagraph.hotkeys[trade['miner_id']]
+                    else:
+                        # Skip trades with invalid miner_id
+                        continue
+                return trading_history
 
             else:
                 bt.logging.info(f"Fetching trading history from {self.trading_history_endpoint} for {self.rolling_history_in_days} days")        
@@ -286,16 +298,20 @@ class Validator:
                     should_score_and_set_weights = True
 
                 # If metadata manager last full sync is more than 2 hours ago, skip scoring and setting weights
-                if self.metadata_manager.last_full_sync < current_time - datetime.timedelta(hours=2) and self.config.subtensor.network != "test":
-                    bt.logging.info("Metadata manager last full sync is more than 2 hours ago. Skipping scoring and setting weights.")
-                    should_score_and_set_weights = False
+                metadata_stats = self.metadata_manager.get_stats()
+                last_full_sync_str = metadata_stats.get("last_full_sync")
+                if last_full_sync_str:
+                    last_full_sync = datetime.datetime.fromisoformat(last_full_sync_str)
+                    if last_full_sync < current_time - datetime.timedelta(hours=2) and self.config.subtensor.network != "test":
+                        bt.logging.warning("Metadata manager last full sync is more than 2 hours ago. Skipping scoring and setting weights.")
+                        should_score_and_set_weights = False
                 
                 if should_score_and_set_weights:
                     # Sync our validator with the metagraph so we have the latest information
                     self.metagraph.sync()
 
                     all_uids = self.metagraph.uids.tolist()
-                    all_hotkeys = self.metagraph.hotkeys.tolist()
+                    all_hotkeys = self.metagraph.hotkeys
 
                     # Fetch the trading history and TAO price with retry logic
                     try:
