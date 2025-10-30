@@ -176,9 +176,10 @@ class PostgresValidatorStorage():
                         CREATE TABLE IF NOT EXISTS epoch_trader_scores (
                             id SERIAL PRIMARY KEY,
                             epoch_date DATE NOT NULL,
+                            account_id INTEGER NOT NULL,
                             miner_uid INTEGER,
                             miner_hotkey VARCHAR(255),
-                            general_pool_id VARCHAR(255),
+                            is_general_pool BOOLEAN NOT NULL,
                             num_predictions INTEGER NOT NULL,
                             num_correct_predictions INTEGER NOT NULL,
                             volume DECIMAL(15, 2) NOT NULL,
@@ -188,71 +189,71 @@ class PostgresValidatorStorage():
                             roi DECIMAL(10, 6) NOT NULL,
                             payout DECIMAL(15, 2) NOT NULL,
                             subnet_weight DECIMAL(10, 6) NOT NULL,
-                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            -- Ensure unique combinations for miners and general pool entries
-                            CONSTRAINT unique_miner_epoch UNIQUE (epoch_date, miner_uid, miner_hotkey),
-                            CONSTRAINT unique_pool_epoch UNIQUE (epoch_date, general_pool_id)
+                            is_payout_distributed BOOLEAN NOT NULL DEFAULT FALSE,
+                            payout_distributed_at TIMESTAMP,
+                            payout_transaction_id VARCHAR(255),
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         )
                     """)
-                    
+
+                    # Create unique index that acts as a constraint for general pool entries
+                    cursor.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS uniq_epoch_general_pool ON epoch_trader_scores(epoch_date, account_id) WHERE is_general_pool = TRUE
+                    """)
+
+                    # Create unique index that acts as a constraint for miner pool entries
+                    cursor.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS uniq_epoch_miner_pool ON epoch_trader_scores(epoch_date, account_id, miner_uid, miner_hotkey) WHERE is_general_pool = FALSE
+                    """)
+
                     # Primary lookup: Find all traders for a specific epoch
                     cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_epoch_date 
-                        ON epoch_trader_scores(epoch_date)
+                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_epoch_date ON epoch_trader_scores(epoch_date)
                     """)
                     
                     # Lookup by miner: Find all epochs for a specific miner
                     cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_miner_uid 
-                        ON epoch_trader_scores(miner_uid)
+                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_miner_uid ON epoch_trader_scores(miner_uid)
                     """)
                     
                     # Lookup by hotkey: Alternative miner identification
                     cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_miner_hotkey 
-                        ON epoch_trader_scores(miner_hotkey)
+                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_miner_hotkey ON epoch_trader_scores(miner_hotkey)
                     """)
                     
-                    # Lookup by pool: Find all traders in a specific pool
+                    # Lookup by account: Find all traders for a specific account
                     cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_general_pool_id 
-                        ON epoch_trader_scores(general_pool_id)
+                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_account_id ON epoch_trader_scores(account_id)
                     """)
                     
                     # Composite index: Find specific trader's performance in specific epoch
                     cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_epoch_miner 
-                        ON epoch_trader_scores(epoch_date, miner_uid)
+                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_epoch_miner ON epoch_trader_scores(epoch_date, miner_uid)
                     """)
                     
-                    # Composite index: Find all traders in pool for specific epoch
+                    # Composite index (general pool only): Find general pool rows for specific epoch/account
                     cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_epoch_pool 
-                        ON epoch_trader_scores(epoch_date, general_pool_id)
+                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_epoch_account_pool ON epoch_trader_scores(epoch_date, account_id) WHERE is_general_pool = TRUE
                     """)
                     
                     # Performance ranking: Order by payout (descending) for leaderboards
                     cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_payout_desc 
-                        ON epoch_trader_scores(epoch_date, payout DESC)
+                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_payout_desc ON epoch_trader_scores(epoch_date, payout DESC)
                     """)
                     
                     # Performance ranking: Order by ROI (descending) for performance analysis
                     cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_roi_desc 
-                        ON epoch_trader_scores(epoch_date, roi DESC)
+                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_roi_desc ON epoch_trader_scores(epoch_date, roi DESC)
                     """)
                     
                     # Performance ranking: Order by volume (descending) for volume analysis
                     cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_volume_desc 
-                        ON epoch_trader_scores(epoch_date, volume DESC)
+                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_volume_desc ON epoch_trader_scores(epoch_date, volume DESC)
                     """)
                     
                     # Performance ranking: Order by PnL (descending) for profit analysis
                     cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_pnl_desc 
-                        ON epoch_trader_scores(epoch_date, pnl DESC)
+                        CREATE INDEX IF NOT EXISTS idx_epoch_trader_scores_pnl_desc ON epoch_trader_scores(epoch_date, pnl DESC)
                     """)
                     
                     connection.commit()
@@ -361,9 +362,10 @@ class PostgresValidatorStorage():
         Args:
             trading_scores: Dictionary containing:
                 - epoch_date: Date of the epoch
+                - account_id: Unique identifier for the account
                 - miner_uid: Unique identifier for the miner
                 - miner_hotkey: Hotkey string for the miner
-                - general_pool_id: ID of the general pool
+                - is_general_pool: Boolean indicating if the trader is a general pool trader
                 - num_predictions: Number of predictions made
                 - num_correct_predictions: Number of correct predictions
                 - volume: Trading volume
@@ -378,20 +380,21 @@ class PostgresValidatorStorage():
             with contextlib.closing(self._create_connection()) as connection:
                 with connection.cursor() as cursor:
                     # Determine which constraint to use based on the data
-                    if trader_scores.get("miner_uid") is not None and trader_scores.get("miner_hotkey") is not None:
+                    if trader_scores.get("miner_uid") is not None and trader_scores.get("miner_hotkey") is not None and trader_scores.get("is_general_pool") is False:
                         # This is a miner entry - use miner constraint
                         cursor.execute("""
                             INSERT INTO epoch_trader_scores (
-                                epoch_date, miner_uid, miner_hotkey, general_pool_id,
+                                epoch_date, account_id, miner_uid, miner_hotkey, is_general_pool,
                                 num_predictions, num_correct_predictions,
                                 volume, qualified_volume, fees, pnl, roi, payout, subnet_weight
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (epoch_date, miner_uid, miner_hotkey) DO NOTHING
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT DO NOTHING
                         """, (
                             trader_scores["epoch_date"],
+                            trader_scores["account_id"],
                             trader_scores["miner_uid"],
                             trader_scores["miner_hotkey"],
-                            trader_scores["general_pool_id"],
+                            trader_scores["is_general_pool"],
                             trader_scores["num_predictions"],
                             trader_scores["num_correct_predictions"],
                             trader_scores["volume"],
@@ -402,20 +405,21 @@ class PostgresValidatorStorage():
                             trader_scores["payout"],
                             trader_scores["subnet_weight"]
                         ))
-                    elif trader_scores.get("general_pool_id") is not None:
+                    elif trader_scores.get("is_general_pool") is True:
                         # This is a general pool entry - use pool constraint
                         cursor.execute("""
                             INSERT INTO epoch_trader_scores (
-                                epoch_date, miner_uid, miner_hotkey, general_pool_id,
+                                epoch_date, account_id, miner_uid, miner_hotkey, is_general_pool,
                                 num_predictions, num_correct_predictions,
                                 volume, qualified_volume, fees, pnl, roi, payout, subnet_weight
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (epoch_date, general_pool_id) DO NOTHING
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT DO NOTHING
                         """, (
                             trader_scores["epoch_date"],
+                            trader_scores["account_id"],
                             trader_scores["miner_uid"],
                             trader_scores["miner_hotkey"],
-                            trader_scores["general_pool_id"],
+                            trader_scores["is_general_pool"],
                             trader_scores["num_predictions"],
                             trader_scores["num_correct_predictions"],
                             trader_scores["volume"],
@@ -430,15 +434,16 @@ class PostgresValidatorStorage():
                         # Fallback - try to insert without conflict handling
                         cursor.execute("""
                             INSERT INTO epoch_trader_scores (
-                                epoch_date, miner_uid, miner_hotkey, general_pool_id,
+                                epoch_date, account_id, miner_uid, miner_hotkey, is_general_pool,
                                 num_predictions, num_correct_predictions,
                                 volume, qualified_volume, fees, pnl, roi, payout, subnet_weight
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """, (
                             trader_scores["epoch_date"],
+                            trader_scores["account_id"],
                             trader_scores["miner_uid"],
                             trader_scores["miner_hotkey"],
-                            trader_scores["general_pool_id"],
+                            trader_scores["is_general_pool"],
                             trader_scores["num_predictions"],
                             trader_scores["num_correct_predictions"],
                             trader_scores["volume"],
@@ -457,7 +462,7 @@ def get_storage() -> PostgresValidatorStorage:
     return PostgresValidatorStorage.get_instance()
 
 
-def log_scores_to_database(miner_history, general_pool_history, miners_scores, general_pool_scores, miner_budget, general_pool_budget, all_hotkeys):
+def log_scores_to_database(miner_history, general_pool_history, miners_scores, general_pool_scores, miner_budget, general_pool_budget, all_hotkeys, weights):
     """
     Utility function to log scores to the database.
     This function handles the conversion from scoring data to database format.
@@ -470,6 +475,7 @@ def log_scores_to_database(miner_history, general_pool_history, miners_scores, g
         miner_budget: Budget allocated to miners
         general_pool_budget: Budget allocated to general pools
         all_hotkeys: List of all hotkeys for the miners
+        weights: List of final weights for all UIDs in the subnet
     """
     try:
         # Get storage instance and initialize
@@ -565,12 +571,18 @@ def log_scores_to_database(miner_history, general_pool_history, miners_scores, g
             
             # Get miner hotkey - all_hotkeys is a list where index = UID
             miner_hotkey = all_hotkeys[miner_uid] if miner_uid < len(all_hotkeys) else None
+
+            # Get account ID from account map
+            account_id = miner_history["account_map"][miner_uid] if miner_uid in miner_history["account_map"] else None
+
+            subnet_weight = weights[miner_uid] if miner_uid < len(weights) else 0.0
             
             trader_data = {
                 "epoch_date": epoch_date,
+                "account_id": account_id,
                 "miner_uid": miner_uid,
                 "miner_hotkey": miner_hotkey,
-                "general_pool_id": None,  # Miners don't have general pool IDs
+                "is_general_pool": False,  # Miners are not general pool traders
                 "num_predictions": current_trades,
                 "num_correct_predictions": current_correct_trades,
                 "volume": round(float(current_volume), 2),
@@ -579,7 +591,7 @@ def log_scores_to_database(miner_history, general_pool_history, miners_scores, g
                 "pnl": round(float(current_profit), 2),
                 "roi": round(float(current_roi), 6),
                 "payout": round(float(miner_tokens[i]) if i < len(miner_tokens) else 0.0, 2),
-                "subnet_weight": round(float(miner_tokens[i] / total_budget) if total_budget > 0 and i < len(miner_tokens) else 0.0, 6)
+                "subnet_weight": round(float(subnet_weight), 6)
             }
             storage.insert_epoch_trader_scores(trader_data)
         
@@ -602,11 +614,15 @@ def log_scores_to_database(miner_history, general_pool_history, miners_scores, g
             # Calculate current epoch ROI
             current_roi = current_profit / current_qualified if current_qualified > 0 else 0.0
             
+            # Get account ID from account map
+            account_id = general_pool_history["account_map"][pool_id] if pool_id in general_pool_history["account_map"] else None
+            
             trader_data = {
                 "epoch_date": epoch_date,
+                "account_id": account_id,
                 "miner_uid": None,  # General pools don't have miner UIDs
                 "miner_hotkey": None,
-                "general_pool_id": pool_id,
+                "is_general_pool": True,
                 "num_predictions": current_trades,
                 "num_correct_predictions": current_correct_trades,
                 "volume": round(float(current_volume), 2),
@@ -615,7 +631,7 @@ def log_scores_to_database(miner_history, general_pool_history, miners_scores, g
                 "pnl": round(float(current_profit), 2),
                 "roi": round(float(current_roi), 6),
                 "payout": round(float(gp_tokens[i]) if i < len(gp_tokens) else 0.0, 2),
-                "subnet_weight": round(float(gp_tokens[i] / total_budget) if total_budget > 0 and i < len(gp_tokens) else 0.0, 6)
+                "subnet_weight": 0.0 # always 0 for general pool
             }
             storage.insert_epoch_trader_scores(trader_data)
         

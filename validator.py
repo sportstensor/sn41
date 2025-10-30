@@ -418,7 +418,7 @@ class Validator:
                     if self.config.db_score_logging:
                         # Log the scores to the database
                         bt.logging.info(f"Logging scores to database...")
-                        log_scores_to_database(miner_history, general_pool_history, miners_scores, general_pool_scores, miner_budget, general_pool_budget, all_hotkeys)
+                        log_scores_to_database(miner_history, general_pool_history, miners_scores, general_pool_scores, miner_budget, general_pool_budget, all_hotkeys, weights)
                         bt.logging.success(f"✅ Successfully logged scores to database!")
 
                 else:
