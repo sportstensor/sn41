@@ -250,6 +250,11 @@ def build_epoch_history(
     account_map = {}
 
     for trade in trading_history:
+        # Skip if the trade does not have an account_id (should not happen)
+        if trade["account_id"] is None:
+            continue
+        
+        # Skip if the trade is not settled
         if not trade["is_settled"]:
             continue
             
