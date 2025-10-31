@@ -97,7 +97,6 @@ from constants import (
   MINER_WEIGHT_PERCENTAGE,
   MIN_EPOCHS_FOR_ELIGIBILITY,
   MIN_PREDICTIONS_FOR_ELIGIBILITY,
-  MIN_ACTIVE_EPOCHS,
   BURN_UID,
   EXCESS_MINER_WEIGHT_UID,
   EXCESS_MINER_MIN_WEIGHT,
@@ -392,13 +391,6 @@ def check_build_up_eligibility(epoch_history: Dict[str, Any]) -> np.ndarray:
         if total_trades < MIN_PREDICTIONS_FOR_ELIGIBILITY:
             eligible[entity_idx] = False
             continue
-            
-        # Check minimum active epochs requirement
-        # An "active epoch" is one where the entity had volume > 0
-        active_epochs = np.sum(volume_prev[:, entity_idx] > 0)
-        if active_epochs < MIN_ACTIVE_EPOCHS:
-            eligible[entity_idx] = False
-            continue
     
     return eligible
 
@@ -467,7 +459,6 @@ def score_with_epochs(
         print(f"Build-up eligibility: {n_build_up_eligible}/{n_entities} entities meet build-up requirements")
         print(f"  - MIN_EPOCHS_FOR_ELIGIBILITY: {MIN_EPOCHS_FOR_ELIGIBILITY}")
         print(f"  - MIN_TRADES_FOR_ELIGIBILITY: {MIN_PREDICTIONS_FOR_ELIGIBILITY}")
-        print(f"  - MIN_ACTIVE_EPOCHS: {MIN_ACTIVE_EPOCHS}")
     
     # Combine all eligibility requirements
     qual_mask = (

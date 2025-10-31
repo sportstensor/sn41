@@ -14,7 +14,6 @@ KAPPA_SCALING_FACTOR = 3 # originally 6
 # Build-up period constants for miner eligibility
 MIN_EPOCHS_FOR_ELIGIBILITY = 5  # Must trade for X epochs
 MIN_PREDICTIONS_FOR_ELIGIBILITY = 5  # Must have X predictions
-MIN_ACTIVE_EPOCHS = 5  # Must be active in X epochs
 
 # Weighting parameters
 # Percentage we allocate to score well-performing miners so they don't get deregistered
