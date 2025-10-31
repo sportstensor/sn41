@@ -70,7 +70,7 @@ MINER_PROFILES = {
         bankroll_multiplier=10.0,
         participation_rate=0.8,
         kelly_aggression_range=(0.3, 0.7),
-        volume_range=(5000, 50000),
+        volume_range=(5000, 10000),
         trading_frequency=2.0,
         description='High-volume professional traders with significant capital'
     ),
@@ -81,7 +81,7 @@ MINER_PROFILES = {
         bankroll_multiplier=3.0,
         participation_rate=0.9,
         kelly_aggression_range=(0.2, 0.6),
-        volume_range=(1000, 10000),
+        volume_range=(500, 5000),
         trading_frequency=3.0,
         description='Skilled traders with consistent strategies'
     ),
@@ -103,7 +103,7 @@ MINER_PROFILES = {
         bankroll_multiplier=0.5,
         participation_rate=0.95,
         kelly_aggression_range=(0.5, 0.9),
-        volume_range=(500, 5000),
+        volume_range=(100, 5000),
         trading_frequency=5.0,
         description='High-frequency traders with poor risk management'
     ),
@@ -114,7 +114,7 @@ MINER_PROFILES = {
         bankroll_multiplier=1.5,
         participation_rate=0.6,
         kelly_aggression_range=(0.2, 0.5),
-        volume_range=(500, 3000),
+        volume_range=(100, 1000),
         trading_frequency=1.5,
         description='Average traders who roughly break even'
     )
@@ -267,6 +267,7 @@ class TradingSimulator:
         # Generate trade data
         trade = {
             'trade_id': self.trade_id_counter,
+            'account_id': gambler.account_id,
             'profile_id': gambler.profile_id,
             'miner_id': gambler.miner_id,
             'miner_hotkey': gambler.miner_hotkey,
@@ -279,7 +280,8 @@ class TradingSimulator:
             'is_settled': True,  # All trades are settled for simulation
             'date_settled': (date + timedelta(days=int(self.rng.integers(1, 4)))).strftime('%Y-%m-%d'),
             'trade_type': self.rng.choice(['buy', 'sell']),
-            'price': round(self.rng.uniform(0.3, 0.8), 1)
+            'price': round(self.rng.uniform(0.3, 0.8), 1),
+            'is_reward_eligible': True
         }
         
         self.trade_id_counter += 1
@@ -291,7 +293,7 @@ class TradingSimulator:
 # MINER GENERATION
 # =============================================================================
 
-def create_miner(uid: int, profile_name: str, rng) -> Gambler:
+def create_miner(uid: int, profile_name: str, account_id: int, rng) -> Gambler:
     """Create a miner with specified profile"""
     profile = MINER_PROFILES[profile_name]
     
@@ -309,6 +311,9 @@ def create_miner(uid: int, profile_name: str, rng) -> Gambler:
     gambler.miner_hotkey = f"5F{rng.integers(1, 10000):04x}"
     gambler.profile_id = f"0x{rng.integers(1, 1000):04x}"  # Generate unique profile_id for this miner
     gambler.is_general_pool = False
+
+    # Generate account ID
+    gambler.account_id = account_id
     
     return gambler
 
@@ -322,7 +327,8 @@ def generate_miner_profiles(num_miners: int, profile_distribution: Dict[str, flo
         profile_name = rng.choice(list(profile_distribution.keys()), 
                                  p=list(profile_distribution.values()))
         
-        gambler = create_miner(i + 1, profile_name, rng)
+        account_id = i + 1
+        gambler = create_miner(i + 1, profile_name, account_id, rng)
         
         # Determine if this miner is in the general pool
         is_general_pool = rng.random() < general_pool_percentage

@@ -133,7 +133,8 @@ def score_miners(
     """
     {
         "trade_id":2206,
-        "profile_id":"0x1234567890abcdef",
+        "account_id":1,
+        "profile_id":"0x1234",
         "miner_id":44,
         "miner_hotkey":"5F12345",
         "is_general_pool":true,
@@ -225,6 +226,7 @@ def build_epoch_history(
     - entity_map: dict mapping entity_id -> column index
     - epoch_dates: list of date strings for each epoch (index 0 = oldest)
     - miner_profiles: dict mapping of miner_id to polymarket_id
+    - account_map: dict mapping of entity_id to account_id
     """
     # Determine date range and number of epochs
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -245,8 +247,14 @@ def build_epoch_history(
     entity_set = set()
     epoch_trades = defaultdict(list)  # epoch_idx -> list of trades
     miner_profiles = {}
+    account_map = {}
 
     for trade in trading_history:
+        # Skip if the trade does not have an account_id (should not happen)
+        if trade["account_id"] is None:
+            continue
+        
+        # Skip if the trade is not settled
         if not trade["is_settled"]:
             continue
             
@@ -285,7 +293,12 @@ def build_epoch_history(
             if not trade["is_general_pool"]:
                 continue
             entity_id = trade["profile_id"]
-            
+
+        # Get account ID and map to entity_id
+        account_id = trade["account_id"]
+        if entity_id not in account_map:
+            account_map[entity_id] = account_id
+                        
         entity_set.add(entity_id)
         epoch_trades[epoch_idx].append((entity_id, trade))
     
@@ -349,7 +362,8 @@ def build_epoch_history(
         "epoch_dates": [str(d) for d in epoch_dates],
         "n_epochs": n_epochs,
         "n_entities": n_entities,
-        "miner_profiles": miner_profiles
+        "miner_profiles": miner_profiles,
+        "account_map": account_map
     }
 
 def check_build_up_eligibility(epoch_history: Dict[str, Any]) -> np.ndarray:
