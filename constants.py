@@ -4,7 +4,7 @@ ROLLING_HISTORY_IN_DAYS = 60
 # Constants for the scoring function
 VOLUME_FEE = 0.01
 ROI_MIN = 0.0
-VOLUME_MIN = 100
+VOLUME_MIN = 10
 VOLUME_DECAY = 0.9
 RAMP = 0.1 # originally 0.1
 RHO_CAP = 0.1 # originally 0.1
@@ -17,8 +17,12 @@ MIN_PREDICTIONS_FOR_ELIGIBILITY = 5  # Must have X predictions
 
 # Weighting parameters
 # Percentage we allocate to score well-performing miners so they don't get deregistered
-GENERAL_POOL_WEIGHT_PERCENTAGE = 0.20
+GENERAL_POOL_WEIGHT_PERCENTAGE = 0.5
 MINER_WEIGHT_PERCENTAGE = 1 - GENERAL_POOL_WEIGHT_PERCENTAGE
+
+# Max percent of the total possible epoch budget that can be allocated.
+# This is used to give more weights (and in turn, more incentives) to the miners when we aren't using the full budget.
+MAX_EPOCH_BUDGET_PERCENTAGE = .25
 
 TOTAL_MINER_ALPHA_PER_DAY = 2952 # 7200 alpha per day for entire subnet * 0.41 (41% for miners)
 

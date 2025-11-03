@@ -100,6 +100,7 @@ from constants import (
   BURN_UID,
   EXCESS_MINER_WEIGHT_UID,
   EXCESS_MINER_MIN_WEIGHT,
+  MAX_EPOCH_BUDGET_PERCENTAGE,
 )
 
 def score_miners(
@@ -173,10 +174,23 @@ def score_miners(
     miner_fees = np.sum(miner_history["fees_prev"][epoch_idx]) if miner_history["n_entities"] > 0 else 0.0
     gp_fees = np.sum(general_pool_history["fees_prev"][epoch_idx]) if general_pool_history["n_entities"] > 0 else 0.0
     current_epoch_fees_collected = miner_fees + gp_fees
+
     # Calculate the budget for each pool based on our constants
     miner_pool_epoch_fees = current_epoch_fees_collected * MINER_WEIGHT_PERCENTAGE
     general_pool_epoch_fees = current_epoch_fees_collected * GENERAL_POOL_WEIGHT_PERCENTAGE
+    # Calculate the max budget for each pool based on our constants. This is the max budget for the pool for the epoch.
+    max_current_epoch_budget = current_epoch_budget * MAX_EPOCH_BUDGET_PERCENTAGE
+    miner_pool_epoch_max_budget = max_current_epoch_budget * MINER_WEIGHT_PERCENTAGE
+    # If max epoch budgets are greater than our fees, set the fees to the max budget. This gives more weights (and in turn, more incentives) to the miners when we aren't using the full budget.
+    miner_pool_max_budget_weighted = miner_pool_epoch_fees
+    if miner_pool_epoch_max_budget > miner_pool_epoch_fees:
+        miner_pool_max_budget_weighted = miner_pool_epoch_max_budget
+        #bt.logging.info(f"Miner pool max budget weighted is greater than fees ({miner_pool_epoch_fees:,.2f}). Setting to {miner_pool_epoch_max_budget:,.2f} ({MAX_EPOCH_BUDGET_PERCENTAGE * 100:.2f}% boost)")
+        print(f"Miner pool max budget is greater than fees ({miner_pool_epoch_fees:,.2f}). Setting to {miner_pool_epoch_max_budget:,.2f} ({MAX_EPOCH_BUDGET_PERCENTAGE * 100:.2f}% boost)")
     
+    # General pool is not eligible for the max budget boost.
+    general_pool_max_budget_weighted = general_pool_epoch_fees
+
     # Calculate the subnet budget for each pool based on our constants. This is the total budget for the subnet for the epoch.
     miner_pool_epoch_budget = current_epoch_budget * MINER_WEIGHT_PERCENTAGE
     general_pool_epoch_budget = current_epoch_budget * GENERAL_POOL_WEIGHT_PERCENTAGE
@@ -185,7 +199,7 @@ def score_miners(
     miners_scores = score_with_epochs(
         epoch_history=miner_history,
         budget=miner_pool_epoch_budget,
-        max_fees_weighted=miner_pool_epoch_fees,
+        max_budget_weighted=miner_pool_max_budget_weighted,
         roi_min=ROI_MIN,
         volume_min=VOLUME_MIN,
         require_epoch_preds=False,
@@ -196,7 +210,7 @@ def score_miners(
     general_pool_scores = score_with_epochs(
         epoch_history=general_pool_history,
         budget=general_pool_epoch_budget,
-        max_fees_weighted=general_pool_epoch_fees,
+        max_budget_weighted=general_pool_max_budget_weighted,
         roi_min=ROI_MIN,
         volume_min=VOLUME_MIN,
         require_epoch_preds=True,
@@ -399,7 +413,7 @@ def score_with_epochs(
     budget: float,
     roi_min: float,
     volume_min: float,
-    max_fees_weighted: float,
+    max_budget_weighted: float,
     require_epoch_preds: bool = False,
     verbose: bool = True
 ):
@@ -511,28 +525,28 @@ def score_with_epochs(
     A dictionary that contains the critial data for the solvers
     """
     p_dict = {
-        "budget": budget,                          # alotted budget
-        "max_fees_weighted": max_fees_weighted,    # max fees weighted
-        "total_volume": np.sum(total_volume),      # all trailing volume
-        "total_q_volume": np.sum(qual_volume),     # all trailing volume
-        "v_prev": qualified_prev_matrix,           # qualified volume array
-        "v_block": current_epoch_volume,           # total qualified vol this epoch
-        "v_memory": v_memory,                      # decaying volume
-        "v_eff": v_eff,                            # History respecting volume
-        "v_qual": qual_volume,                     # qualified volume
-        "block_v_qual": qual_volume,               # block qualified volume
-        "roi_trailing": roi_trailing,              # trailing roi
-        "roi_block": current_epoch_roi,            # block roi array
-        "roi_qual": qual_volume,                   # qualified volume
-        "block_roi_qual": qual_volume,             # block qualified volume
-        "epoch_history": epoch_history,            # epoch history for build-up checks
+        "budget": budget,                           # alotted budget
+        "max_budget_weighted": max_budget_weighted, # max budget weighted
+        "total_volume": np.sum(total_volume),       # all trailing volume
+        "total_q_volume": np.sum(qual_volume),      # all trailing volume
+        "v_prev": qualified_prev_matrix,            # qualified volume array
+        "v_block": current_epoch_volume,            # total qualified vol this epoch
+        "v_memory": v_memory,                       # decaying volume
+        "v_eff": v_eff,                             # History respecting volume
+        "v_qual": qual_volume,                      # qualified volume
+        "block_v_qual": qual_volume,                # block qualified volume
+        "roi_trailing": roi_trailing,               # trailing roi
+        "roi_block": current_epoch_roi,             # block roi array
+        "roi_qual": qual_volume,                    # qualified volume
+        "block_roi_qual": qual_volume,              # block qualified volume
+        "epoch_history": epoch_history,             # epoch history for build-up checks
         # --- CONSTRAINT SETTINGS ---
-        "roi_min": roi_min,                        # minimum roi constraint
-        "v_min": volume_min,                       # minimum volume constraint
-        "x_prev": x_prev,                          # allocations this epoch. @TODO: verify with Stephen (currently not in use)
-        "kappa_bar": kappa_bar,                    # payout rate
-        "ramp": RAMP,                              # allocation delta rate
-        "rho_cap": RHO_CAP,                        # max allocation per miner
+        "roi_min": roi_min,                         # minimum roi constraint
+        "v_min": volume_min,                        # minimum volume constraint
+        "x_prev": x_prev,                           # allocations this epoch. @TODO: verify with Stephen (currently not in use)
+        "kappa_bar": kappa_bar,                     # payout rate
+        "ramp": RAMP,                               # allocation delta rate
+        "rho_cap": RHO_CAP,                         # max allocation per miner
         "require_epoch_preds": require_epoch_preds  # require current epoch predictions toggle
     }
     
@@ -821,7 +835,7 @@ def solve_phase2(p, x1, T1, verbose=False):
     v_eff        = p["v_eff"]
     roi          = p["roi_trailing"]
     B            = p["budget"]
-    max_fees     = p.get("max_fees_weighted", B) # default to budget if not provided
+    max_budget   = p.get("max_budget_weighted", B) # default to budget if not provided
     kappa        = p["kappa_bar"]
 
     # Token cost per miner if fully opened
@@ -869,7 +883,7 @@ def solve_phase2(p, x1, T1, verbose=False):
     cons = []
     cons += [x >= 0, x <= 1]
     cons += [x <= eligible]                 # eligibility
-    cons += [c @ x <= min(P1, B, max_fees)] # fixed total payout (ensured not greater than budget or max fees weighted)
+    cons += [c @ x <= min(P1, B, max_budget)] # fixed total payout (ensured not greater than budget or max budget weighted)
 
     # Objective: favor ROI while staying close to prior gates
     # dynamic smoothness penalty λ
@@ -900,7 +914,7 @@ def solve_phase2(p, x1, T1, verbose=False):
         "status": prob.status,
         "x_star": None if x.value is None else x.value.copy(),
         "c_star": c,
-        "payout": min(P1, B, max_fees), # ensure payout is not greater than budget or max fees weighted
+        "payout": min(P1, B, max_budget), # ensure payout is not greater than budget or max budget weighted
     }
 
 """
