@@ -1,229 +1,160 @@
 
-# Bittensor Subnet Template
+<div align="center">
 
-This repository provides a minimal template for setting up a simple Bittensor subnet with a miner and a validator. The miner and validator communicate using a custom protocol defined in `protocol.py`. This template serves as a starting point for developers interested in building on the Bittensor network.
+# SN41: The future of prediction algorithms
+## Powered by Sportstensor
 
-## Table of Contents
+</div>
 
-- [Overview](#overview)
-- [Project Structure](#project-structure)
-- [Prerequisites](#prerequisites)
-- [Setup Instructions](#setup-instructions)
-  - [1. Clone the Repository](#1-clone-the-repository)
-  - [2. Install Dependencies](#2-install-dependencies)
-  - [3. Create Wallets](#3-create-wallets)
-  - [4. Register Wallets](#4-register-wallets)
-- [Running the Miner and Validator](#running-the-miner-and-validator)
-  - [Running the Miner](#running-the-miner)
-  - [Running the Validator](#running-the-validator)
-- [Monitoring and Logging](#monitoring-and-logging)
-- [Customization](#customization)
-- [Notes and Considerations](#notes-and-considerations)
+- [Introduction](#introduction)
+- [Why is this important?](#why-is-this-important)
+- [Miner and Validator Functionality](#miner-and-validator-functionality)
+  - [Miner](#miner)
+  - [Validator](#validator)
+- [Running Miners and Validators](#running-miners-and-validators)
+  - [Running a Miner](#running-a-miner)
+  - [Running a Validator](#running-a-validator)
+- [Community](#community)
 - [License](#license)
 
----
+## Introduction (@TODO: update this section)
 
-## Overview
+Welcome to Sportstensor—the convergence of cutting-edge technology and sports data analytics. We are pioneering unprecedented innovation in sports prediction algorithms, powered by the Bittensor network.
 
-This template demonstrates how to:
+The Sportstensor subnet is designed to incentivize the discovery of competitive advantages such as 'edge' over closing market odds, enabling top miners within the network to establish machine-driven dominance across the sports prediction landscape.
 
-- Set up a basic miner that responds to queries from validators.
-- Implement a validator that sends queries to miners and adjusts their scores based on responses.
-- Use a custom protocol for communication between the miner and validator.
-- Update weights on the Bittensor blockchain based on miner performance.
+[DeepWiki Summary](https://deepwiki.com/sportstensor/sportstensor)
 
-By following this guide, you'll have a functional miner and validator interacting on a Bittensor subnet.
+## Why is this important? (@TODO: update this section)
+- Closing odds represent the pinnacle of market efficiency, determined by thousands of advanced machine learning algorithms.
+- Our subnet fosters the development of true machine intelligence by outperforming competing algorithms in a highly competitive AI-versus-AI environment.
+- Even with sophisticated models, bettors struggle to be profitable, as bookmakers frequently impose strict limits on consistent winners.
+- There is substantial demand for high-performing predictive AI from betting operators, financial firms, syndicates, and algorithmic traders seeking more accurate models.
+- We attract top AI and machine learning talent from diverse industries, encouraging them to revolutionize sports prediction markets.
+- By decentralizing the creation and improvement of predictive models, we reduce reliance on any single entity or algorithm, enhancing resilience and driving innovation in the sports prediction market.
 
-## Project Structure
+## Miner and Validator Functionality
 
-```
-bittensor_subnet/
-├── miner.py          # Miner node script
-├── validator.py      # Validator node script
-└── protocol.py       # Custom protocol definition
-```
+### Miner (@TODO: update this section)
 
-- **miner.py**: Implements a miner that listens for incoming requests and responds according to the protocol.
-- **validator.py**: Implements a validator that sends requests to miners and updates their scores.
-- **protocol.py**: Defines the custom protocol used for communication between the miner and validator.
+- Miners leverage their edge on a variety of curated markets via trading on Almanac.
+- Collateral requirements reduce noise and the best signals rise to the top.
+- Miners are open to utilize trained machine learning models or whatever methods they choose to make +EV probabilities.
+- Miners who consistently win and drive substantial volume will be rewarded the most.
 
-## Prerequisites
+### Validator
 
-Before you begin, ensure you have the following installed:
+- **Metadata Syncing**: The validator operates in an endless loop, syncing the subnet metadata submitted to the chain by miners. This metadata gets stored in a local state file and used during the validation and scoring steps.
+- **Prediction Scoring**: At specific intervals, the validator queries all miner trading history over `ROLLING_HISTORY_IN_DAYS` days, runs various validation checks, calculates the rewards, and sets weights onchain.
 
-- Python 3.10 or higher
-- [Git](https://git-scm.com/)
-- [Bittensor SDK](https://github.com/opentensor/bittensor)
+### Scoring and Weights
+ 
+- Incentives and scores are calculated every hour in a background thread.
+- Validators are always calculating the previous epoch rewards based on each miner's historical performance.
+  - For example, let's say the time just became 12a midnight on Monday. Validators will be calculating the rewards for Sunday and setting weights accordingly through the current epoch (Monday).
+- Incentive scores are calculated through a series of complex algorithms. Please see our whitepaper for more details. Also analyze `scoring.py`.
+- Validators set the miners' weights on the chain based on these scores.
 
-## Setup Instructions
+## Running Miners and Validators
 
-### 1. Clone the Repository
+### Running a Miner
+#### Requirements
+- Polymarket account
+- Almanac account
+- Almanac account connected to registered Bittensor coldkey
+- Python 3.10+
+- Pip
+- CPU
 
-Clone this repository to your local machine:
+#### Bittensor Wallet and Subnet Registration
+You will need a Bittensor wallet and a registered UID on subnet in order to mine.
+Bittensor Wallet help: [https://docs.learnbittensor.org/keys/wallets](https://docs.learnbittensor.org/keys/wallets)
+Subnet registration help: [https://docs.learnbittensor.org/miners](https://docs.learnbittensor.org/miners)
 
+#### Almanac and Polymarket Setup (add screenshots?)
+1. Visit [Almanac](https://almanac.market) and click 'Create Account'
+2. Complete all account creation steps
+3. Complete one-time Bittensor connection to your Almanac account
+- Download and install the [Bittensor wallet extension](https://www.bittensor.com/wallet)
+- Create/import the coldkey that registered your miner's hotkey and UID
+- Connect your wallet to Almanac in account settings
+- Confirm the selection of your registered hotkey and UID
+
+#### Miner Metadata Registration
+1. To start, clone the repository and `cd` to it:
 ```bash
-git clone https://github.com/yourusername/bittensor_subnet.git
-cd bittensor_subnet
+git clone https://github.com/sportstensor/sn41/
+cd sn41
 ```
+2. Next, install the requirements: `pip install -r requirements.txt`
+3. Run `python miner.py` and follow prompts to submit your Polymarket wallet address to the subnet blockchain metadata.
+- Run `python miner.py --subtensor.network test --netuid 172` for testnet
 
-### 2. Install Dependencies
+#### Miner Trading with Almanac dApp
+Miners are more than welcome to trade directly on [Almanac](https://almanac.market). Once the steps above are completed, use the app to make trades and validators will automoatically pick up your trading history performance and score you accordingly.
 
-Install the required Python packages:
+#### Miner Trading with API
+If you would like to programmatically trade on Almanac, you will need to:
+- Complete all the setup steps defined above
+- Integrate API trading logic into your workflow.
 
+--- ADD INFO ABOUT THE API TRADING LOGIC ---
+
+
+### Running a Validator
+#### Requirements
+- Python 3.10+
+- Pip
+- CPU
+
+#### Weights & Biases
+It is recommended to utilize W&B. Set environment variable with `export WANDB_API_KEY=<your API key>`. Alternatively, you can disable W&B with --wandb.off
+
+#### Setup
+1. To start, clone the repository and `cd` to it:
 ```bash
-pip install bittensor
+git clone https://github.com/sportstensor/sn41/
+cd sn41
 ```
+2. Install pm2 if you don't already have it: [pm2.io](https://pm2.io/docs/runtime/guide/installation/).
+3. Next, install the requirements: `pip install -r requirements.txt`
 
-> **Note**: It's recommended to use a virtual environment to manage dependencies.
-
-### 3. Create Wallets
-
-You'll need to create wallets for both the miner and validator.
-
-#### Using `btcli`
-
-The `btcli` tool is used to manage wallets and keys.
-
-1. **Create a Coldkey** (shared between miner and validator):
-
-   ```bash
-   btcli w new_coldkey --wallet.name mywallet
-   ```
-
-2. **Create Hotkeys**:
-
-   - **Miner Hotkey**:
-
-     ```bash
-     btcli w new_hotkey --wallet.name mywallet --wallet.hotkey miner_hotkey
-     ```
-
-   - **Validator Hotkey**:
-
-     ```bash
-     btcli w new_hotkey --wallet.name mywallet --wallet.hotkey validator_hotkey
-     ```
-
-### 4. Register Wallets
-
-Register both the miner and validator on the Bittensor network.
-
-- **Register the Miner**:
-
-  ```bash
-  btcli s register --wallet.name mywallet --wallet.hotkey miner_hotkey --subtensor.network finney
-  ```
-
-- **Register the Validator**:
-
-  ```bash
-  btcli s register --wallet.name mywallet --wallet.hotkey validator_hotkey --subtensor.network finney
-  ```
-
-> **Note**: Replace `finney` with the name of the network you are connecting to if different.
-
----
-
-## Running the Miner and Validator
-
-### Running the Miner
-
-In one terminal window, navigate to the project directory and run:
-
+#### Run auto-updating validator with PM2 (recommended)
 ```bash
-python miner.py --wallet.name mywallet --wallet.hotkey miner_hotkey --subtensor.network finney --axon.port 8901
+pm2 start vali_auto_update.sh --name sn41-validator -- \
+    --netuid 41 \
+    --wallet.name {wallet} \
+    --wallet.hotkey {hotkey} \
+    --axon.port {port} \
+    --logging.debug
 ```
+> [!NOTE]
+> You might need to adjust "python" to "python3" within the `vali_auto_update.sh` depending on your preferred system python.
 
-**Arguments**:
-
-- `--wallet.name`: The name of the wallet.
-- `--wallet.hotkey`: The hotkey name for the miner.
-- `--subtensor.network`: The Bittensor network to connect to.
-
-### Running the Validator
-
-In another terminal window, navigate to the project directory and run:
-
+#### Run basic validator with PM2
 ```bash
-python validator.py --wallet.name mywallet --wallet.hotkey validator_hotkey --subtensor.network finney
+pm2 start validator.py --name sn41-validator -- \
+    --netuid {netuid} \
+    --wallet.name {wallet} \
+    --wallet.hotkey {hotkey} \
+    --axon.port {port} \
+    --logging.debug
 ```
 
-**Arguments**:
+## Environments
 
-- `--wallet.name`: The name of the wallet.
-- `--wallet.hotkey`: The hotkey name for the validator.
-- `--subtensor.network`: The Bittensor network to connect to.
+| Network | Netuid |
+| ----------- | -----: |
+| Mainnet     |     41 |
+| Testnet     |    172 |
 
----
+## Community
 
-## Monitoring and Logging
-
-Both the miner and validator will output logs to the console and save logs to files in the following directory structure:
-
-```
-~/.bittensor/wallets/<wallet.name>/<wallet.hotkey>/netuid<netuid>/<miner or validator>/
-```
-
-- **Miner Logs**: Located in the `miner` directory.
-- **Validator Logs**: Located in the `validator` directory.
-
-You can monitor these logs to observe the interactions and performance metrics.
-
----
-
-## Customization
-
-### Modifying the Protocol
-
-The communication protocol is defined in `protocol.py`. You can modify or extend the `Dummy` class to implement more complex interactions.
-
-Example:
-
-```python
-class CustomProtocol(bt.Synapse):
-    # Define your custom protocol attributes and methods
-    ...
-```
-
-Update `miner.py` and `validator.py` to use your custom protocol.
-
-### Adjusting Scoring Logic
-
-In `validator.py`, the validator adjusts miner scores based on their responses. You can modify the scoring logic in the main loop to suit your needs.
-
-Example:
-
-```python
-# Custom scoring logic
-if resp_i == expected_value:
-    score = 1
-else:
-    score = 0
-```
-
-# Optional Validator dependencies if running with postgres database
-python-dotenv
-psycopg2-binary
-
-### Changing Network Parameters
-
-You can adjust network parameters like `netuid`, timeouts, and other settings via command-line arguments or by modifying the code.
-
----
-
-## Notes and Considerations
-
-- **Security**: This template is for educational purposes. In a production environment, ensure robust security measures are in place.
-- **Error Handling**: The provided code includes basic error handling. Enhance it to handle edge cases and exceptions gracefully.
-- **Network Compatibility**: Ensure that the `netuid` and `subtensor.network` values match the subnet you intend to connect to.
-- **Bittensor Updates**: Bittensor is an evolving project. Keep your SDK updated and adjust the code as necessary to accommodate changes.
-
----
+Join the vibrant Bittensor community and find our channel `#פ • sporτsτensor • 41` on [Discord](https://discord.gg/bittensor).
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+The SN41 Sportstensor subnet is released under the [MIT License](./LICENSE).
 
 ---
-
-Feel free to contribute, raise issues, or suggest improvements to this template. Happy mining and validating on the Bittensor network!
+</div>
