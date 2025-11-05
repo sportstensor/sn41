@@ -1,6 +1,15 @@
 
 <div align="center">
 
+ $$$$$$\  $$\       $$\      $$\  $$$$$$\  $$\   $$\  $$$$$$\   $$$$$$\  
+$$  __$$\ $$ |      $$$\    $$$ |$$  __$$\ $$$\  $$ |$$  __$$\ $$  __$$\ 
+$$ /  $$ |$$ |      $$$$\  $$$$ |$$ /  $$ |$$$$\ $$ |$$ /  $$ |$$ /  \__|
+$$$$$$$$ |$$ |      $$\$$\$$ $$ |$$$$$$$$ |$$ $$\$$ |$$$$$$$$ |$$ |      
+$$  __$$ |$$ |      $$ \$$$  $$ |$$  __$$ |$$ \$$$$ |$$  __$$ |$$ |      
+$$ |  $$ |$$ |      $$ |\$  /$$ |$$ |  $$ |$$ |\$$$ |$$ |  $$ |$$ |  $$\ 
+$$ |  $$ |$$$$$$$$\ $$ | \_/ $$ |$$ |  $$ |$$ | \$$ |$$ |  $$ |\$$$$$$  |
+\__|  \__|\________|\__|     \__|\__|  \__|\__|  \__|\__|  \__| \______/ 
+
 # SN41: The future of prediction algorithms
 ## Powered by Sportstensor
 
@@ -11,8 +20,8 @@
 - [Miner and Validator Functionality](#miner-and-validator-functionality)
   - [Miner](#miner)
   - [Validator](#validator)
-- [Running Miners and Validators](#running-miners-and-validators)
-  - [Running a Miner](#running-a-miner)
+- [Miner setup and running Validators](#miner-setup-and-running-validators)
+  - [Setting up a Miner](#setting-up-a-miner)
   - [Running a Validator](#running-a-validator)
 - [Community](#community)
 - [License](#license)
@@ -55,9 +64,9 @@ The Sportstensor subnet is designed to incentivize the discovery of competitive 
 - Incentive scores are calculated through a series of complex algorithms. Please see our whitepaper for more details. Also analyze `scoring.py`.
 - Validators set the miners' weights on the chain based on these scores.
 
-## Running Miners and Validators
+## Miner setup and running Validators
 
-### Running a Miner
+### Setting up a Miner
 #### Requirements
 - Polymarket account
 - Almanac account
