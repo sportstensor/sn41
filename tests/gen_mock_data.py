@@ -5,6 +5,40 @@ Advanced Mock Trading Data Generator for Prediction Market Scoring System
 This script generates sophisticated synthetic trading data using realistic
 gambler behavior, skill-based trading logic, and market dynamics.
 It combines simulation logic from the sims/ directory into a self-contained generator.
+
+Examples of usage:
+# Slow ramp-up scenario (subnet launch simulation)
+python gen_mock_data.py --miners 20 --days 90 --enable-ramp \
+  --ramp-type logistic --onboarding-strategy exponential \
+  --onboarding-period-days 45 --participation-ramp-days 30 \
+  --volume-ramp-days 30
+  
+# Gradual uniform onboarding
+python gen_mock_data.py --miners 15 --days 60 --enable-ramp --onboarding-strategy uniform \
+  --onboarding-period-days 30
+  
+# Gradual exponential onboarding
+python gen_mock_data.py --miners 15 --days 60 --enable-ramp --onboarding-strategy exponential \
+  --onboarding-period-days 30
+  
+# Gradual logistic onboarding
+python gen_mock_data.py --miners 15 --days 60 --enable-ramp --onboarding-strategy logistic \
+  --onboarding-period-days 30
+
+# Gradual uniform participation rate ramp-up
+python gen_mock_data.py --miners 15 --days 60 --enable-ramp --ramp-type linear \
+  --participation-ramp-days 30 --participation-ramp-start 0.1 --participation-ramp-end 1.0
+  
+# Gradual volume ramp-up
+python gen_mock_data.py --miners 15 --days 60 --enable-ramp --ramp-type linear \
+  --volume-ramp-days 30 --volume-ramp-start 0.1 --volume-ramp-end 1.0
+  
+# Gradual participation rate and volume ramp-up
+python gen_mock_data.py --miners 15 --days 60 --enable-ramp --ramp-type logistic \
+  --participation-ramp-days 30 --participation-ramp-start 0.1 --participation-ramp-end 1.0 \
+  --volume-ramp-days 30 --volume-ramp-start 0.1 --volume-ramp-end 1.0
+  
+
 """
 
 import random
@@ -43,6 +77,53 @@ KELLY_BETA = 3.0
 
 # Protocol fee
 FEE_RATE = 0.01
+
+# =============================================================================
+# TIME-BASED RAMP FUNCTIONS
+# =============================================================================
+
+def linear_ramp(t: float, t_start: float = 0.0, t_end: float = 1.0, 
+                min_val: float = 0.0, max_val: float = 1.0) -> float:
+    """
+    Linear ramp from min_val to max_val over [t_start, t_end]
+    t: current time (normalized 0-1)
+    """
+    if t < t_start:
+        return min_val
+    if t > t_end:
+        return max_val
+    progress = (t - t_start) / (t_end - t_start) if t_end > t_start else 1.0
+    return min_val + (max_val - min_val) * progress
+
+def sigmoid_ramp(t: float, center: float = 0.5, steepness: float = 10.0,
+                 min_val: float = 0.0, max_val: float = 1.0) -> float:
+    """
+    Sigmoid ramp for smooth S-curve transition
+    center: where the transition happens (0-1)
+    steepness: how steep the curve is (higher = steeper)
+    """
+    sigmoid = 1.0 / (1.0 + np.exp(-steepness * (t - center)))
+    return min_val + (max_val - min_val) * sigmoid
+
+def exponential_ramp(t: float, growth_rate: float = 2.0,
+                    min_val: float = 0.0, max_val: float = 1.0) -> float:
+    """
+    Exponential ramp for rapid early growth that slows down
+    growth_rate: how fast it grows (higher = faster)
+    """
+    # Normalize to 0-1 range
+    exp_val = (np.exp(growth_rate * t) - 1.0) / (np.exp(growth_rate) - 1.0)
+    return min_val + (max_val - min_val) * np.clip(exp_val, 0.0, 1.0)
+
+def logistic_ramp(t: float, k: float = 5.0, x0: float = 0.5,
+                  min_val: float = 0.0, max_val: float = 1.0) -> float:
+    """
+    Logistic growth curve (S-curve) - slow start, fast middle, slow end
+    k: growth rate
+    x0: midpoint of the curve
+    """
+    logistic = 1.0 / (1.0 + np.exp(-k * (t - x0)))
+    return min_val + (max_val - min_val) * logistic
 
 # =============================================================================
 # MINER PROFILE TYPES
@@ -127,12 +208,14 @@ MINER_PROFILES = {
 class Gambler:
     """Individual gambler with skill-based betting behavior"""
     
-    def __init__(self, skill: float, bankroll: float, profile: MinerProfile, rng):
+    def __init__(self, skill: float, bankroll: float, profile: MinerProfile, rng, 
+                 start_date: Optional[datetime] = None):
         self.skill = skill
         self.bankroll = bankroll
         self.original_bankroll = bankroll
         self.profile = profile
         self.rng = rng
+        self.start_date = start_date  # When this miner joined the network
         
         # Kelly aggression based on profile
         kelly_alpha, kelly_beta = KELLY_ALPHA, KELLY_BETA
@@ -147,8 +230,11 @@ class Gambler:
         self.total_volume = 0.0
         self.total_pnl = 0.0
         
-    def stake_size(self, odds: float) -> float:
-        """Compute stake size via Kelly fraction and perceived edge"""
+    def stake_size(self, odds: float, volume_ramp_factor: float = 1.0) -> float:
+        """
+        Compute stake size via Kelly fraction and perceived edge
+        volume_ramp_factor: time-based multiplier for volume (0-1 scales up to full volume)
+        """
         fair_prob = 1.0 / odds
         
         # Perceived probability based on skill
@@ -163,17 +249,29 @@ class Gambler:
         
         stake = float(self.bankroll * f_star)
         
-        # Apply volume constraints from profile
+        # Apply volume constraints from profile, scaled by ramp factor
         min_vol, max_vol = self.profile.volume_range
-        stake = np.clip(stake, min_vol, max_vol)
+        # Scale volume range based on ramp factor (start conservative, ramp up)
+        scaled_min_vol = min_vol * volume_ramp_factor
+        scaled_max_vol = max_vol * volume_ramp_factor
+        stake = np.clip(stake, scaled_min_vol, scaled_max_vol)
         
         return stake
     
     def should_trade_today(self, base_participation: float = 0.25) -> bool:
-        """Determine if gambler should trade today"""
+        """
+        Determine if gambler should trade today
+        base_participation: base participation rate (may already include ramp factor)
+        """
         # Combine base participation with profile participation rate
         effective_rate = base_participation * self.profile.participation_rate
         return self.rng.random() < effective_rate
+    
+    def is_active(self, current_date: datetime) -> bool:
+        """Check if miner is active (has joined the network)"""
+        if self.start_date is None:
+            return True  # Always active if no start date specified
+        return current_date >= self.start_date
     
     def update_bankroll(self, win: bool, stake: float, odds: float) -> None:
         """Update bankroll after a bet resolves"""
@@ -237,8 +335,12 @@ class TradingSimulator:
         return float(max(1.01, np.exp(self.rng.normal(np.log(base_odds), odds_sigma))))
     
     def simulate_trade(self, gambler: Gambler, market_id: str, date: datetime, 
-                      base_odds: float = 2.0, odds_sigma: float = 0.3) -> Optional[Dict]:
-        """Simulate a single trade for a gambler"""
+                      base_odds: float = 2.0, odds_sigma: float = 0.3,
+                      volume_ramp_factor: float = 1.0) -> Optional[Dict]:
+        """
+        Simulate a single trade for a gambler
+        volume_ramp_factor: time-based multiplier for volume scaling
+        """
         
         # Generate odds
         odds = self.generate_odds(base_odds, odds_sigma)
@@ -252,8 +354,8 @@ class TradingSimulator:
         λ = np.tanh(gambler.skill * 5.0)
         p_true = expit((1 - λ) * logit(fair_prob) + λ * logit(true_prob))
         
-        # Calculate stake size
-        stake = gambler.stake_size(odds)
+        # Calculate stake size with volume ramp
+        stake = gambler.stake_size(odds, volume_ramp_factor)
         if stake <= 0:
             return None
         
@@ -293,7 +395,8 @@ class TradingSimulator:
 # MINER GENERATION
 # =============================================================================
 
-def create_miner(uid: int, profile_name: str, account_id: int, rng) -> Gambler:
+def create_miner(uid: int, profile_name: str, account_id: int, rng, 
+                 start_date: Optional[datetime] = None) -> Gambler:
     """Create a miner with specified profile"""
     profile = MINER_PROFILES[profile_name]
     
@@ -305,8 +408,8 @@ def create_miner(uid: int, profile_name: str, account_id: int, rng) -> Gambler:
     skill_correlation = RHO * skill * base_bankroll
     bankroll = max(BANKROLL_FLOOR, base_bankroll + skill_correlation) * profile.bankroll_multiplier
     
-    # Create gambler
-    gambler = Gambler(skill, bankroll, profile, rng)
+    # Create gambler with optional start date
+    gambler = Gambler(skill, bankroll, profile, rng, start_date=start_date)
     gambler.miner_id = uid
     gambler.miner_hotkey = f"5F{rng.integers(1, 10000):04x}"
     gambler.profile_id = f"0x{rng.integers(1, 1000):04x}"  # Generate unique profile_id for this miner
@@ -318,9 +421,55 @@ def create_miner(uid: int, profile_name: str, account_id: int, rng) -> Gambler:
     return gambler
 
 def generate_miner_profiles(num_miners: int, profile_distribution: Dict[str, float], 
-                          general_pool_percentage: float, rng) -> List[Gambler]:
-    """Generate miners with specified profile distribution"""
+                          general_pool_percentage: float, rng,
+                          onboarding_strategy: str = 'immediate',
+                          first_date: Optional[datetime] = None,
+                          last_date: Optional[datetime] = None,
+                          onboarding_period_days: Optional[int] = None) -> List[Gambler]:
+    """
+    Generate miners with specified profile distribution
+    
+    onboarding_strategy: 'immediate' (all start at first_date), 
+                        'uniform' (spread evenly), 
+                        'exponential' (more join early),
+                        'logistic' (S-curve, slow start/end, fast middle)
+    """
     gamblers = []
+    
+    # Generate start dates based on strategy
+    start_dates = []
+    if onboarding_strategy == 'immediate' or first_date is None:
+        start_dates = [first_date] * num_miners
+    elif onboarding_strategy == 'uniform':
+        # Spread evenly over onboarding period
+        if onboarding_period_days is None:
+            onboarding_period_days = (last_date - first_date).days if last_date else 30
+        for i in range(num_miners):
+            days_offset = int((i / max(num_miners - 1, 1)) * onboarding_period_days)
+            start_dates.append(first_date + timedelta(days=days_offset))
+    elif onboarding_strategy == 'exponential':
+        # More miners join early
+        if onboarding_period_days is None:
+            onboarding_period_days = (last_date - first_date).days if last_date else 30
+        for i in range(num_miners):
+            # Exponential distribution: more early joiners
+            t = rng.exponential(scale=0.3)  # Scale controls how front-loaded
+            t = np.clip(t, 0.0, 1.0)
+            days_offset = int(t * onboarding_period_days)
+            start_dates.append(first_date + timedelta(days=days_offset))
+    elif onboarding_strategy == 'logistic':
+        # S-curve: slow start, fast middle, slow end
+        if onboarding_period_days is None:
+            onboarding_period_days = (last_date - first_date).days if last_date else 30
+        for i in range(num_miners):
+            # Use logistic distribution for S-curve
+            t = i / max(num_miners - 1, 1)
+            # Transform to create S-curve
+            logistic_t = 1.0 / (1.0 + np.exp(-10.0 * (t - 0.5)))
+            days_offset = int(logistic_t * onboarding_period_days)
+            start_dates.append(first_date + timedelta(days=days_offset))
+    else:
+        start_dates = [first_date] * num_miners
     
     for i in range(num_miners):
         # Select profile based on distribution
@@ -328,7 +477,8 @@ def generate_miner_profiles(num_miners: int, profile_distribution: Dict[str, flo
                                  p=list(profile_distribution.values()))
         
         account_id = i + 1
-        gambler = create_miner(i + 1, profile_name, account_id, rng)
+        start_date = start_dates[i] if i < len(start_dates) else first_date
+        gambler = create_miner(i + 1, profile_name, account_id, rng, start_date=start_date)
         
         # Determine if this miner is in the general pool
         is_general_pool = rng.random() < general_pool_percentage
@@ -376,9 +526,30 @@ def generate_advanced_mock_data(
     odds_sigma: float = 0.3,
     participation_rate: float = 0.25,
     general_pool_percentage: float = 0.0,
-    seed: int = None
+    seed: int = None,
+    # Ramp configuration
+    enable_ramp: bool = False,
+    ramp_type: str = 'logistic',
+    participation_ramp_start: float = 0.1,
+    participation_ramp_end: float = 1.0,
+    participation_ramp_days: int = 30,
+    volume_ramp_start: float = 0.1,
+    volume_ramp_end: float = 1.0,
+    volume_ramp_days: int = 30,
+    onboarding_strategy: str = 'immediate',
+    onboarding_period_days: int = 30
 ) -> None:
-    """Generate sophisticated mock trading data"""
+    """
+    Generate sophisticated mock trading data with optional time-based ramp-up
+    
+    Ramp parameters:
+    - enable_ramp: Enable time-based ramp-up simulation
+    - ramp_type: 'linear', 'sigmoid', 'exponential', 'logistic'
+    - participation_ramp_*: Control participation rate ramp-up
+    - volume_ramp_*: Control volume ramp-up
+    - onboarding_strategy: 'immediate', 'uniform', 'exponential', 'logistic'
+    - onboarding_period_days: Days over which miners join (for staggered onboarding)
+    """
     
     # Set up random number generator
     if seed is not None:
@@ -410,40 +581,102 @@ def generate_advanced_mock_data(
     markets = generate_markets(num_markets, base_date.year)
     print(f"Generated {len(markets)} markets")
     
-    # Generate miners
-    gamblers = generate_miner_profiles(num_miners, profile_distribution, general_pool_percentage, rng)
+    # Generate trading dates first (needed for onboarding dates)
+    trading_dates = generate_trading_dates(base_date, num_days)
+    print(f"Generated {len(trading_dates)} trading days")
+    
+    # Determine first and last dates for onboarding
+    first_date = trading_dates[0] if trading_dates else base_date
+    last_date = trading_dates[-1] if trading_dates else base_date
+    
+    # Generate miners with optional staggered onboarding
+    if enable_ramp and onboarding_strategy != 'immediate':
+        gamblers = generate_miner_profiles(
+            num_miners, profile_distribution, general_pool_percentage, rng,
+            onboarding_strategy=onboarding_strategy,
+            first_date=first_date,
+            last_date=last_date,
+            onboarding_period_days=onboarding_period_days
+        )
+        print(f"Using {onboarding_strategy} onboarding strategy over {onboarding_period_days} days")
+    else:
+        gamblers = generate_miner_profiles(num_miners, profile_distribution, general_pool_percentage, rng)
+    
     print(f"Generated {len(gamblers)} miners")
     print(f"General pool percentage: {general_pool_percentage:.1%}")
     general_pool_count = sum(1 for g in gamblers if g.is_general_pool)
     print(f"General pool miners: {general_pool_count}/{len(gamblers)}")
     
-    # Generate trading dates
-    trading_dates = generate_trading_dates(base_date, num_days)
-    print(f"Generated {len(trading_dates)} trading days")
+    if enable_ramp:
+        active_miners_by_day = [sum(1 for g in gamblers if g.is_active(date)) for date in trading_dates]
+        print(f"Active miners: {min(active_miners_by_day)} (day 1) -> {max(active_miners_by_day)} (day {len(trading_dates)})")
     
     # Initialize simulator
     simulator = TradingSimulator(seed=seed if seed else 0)
     
+    # Select ramp function
+    ramp_functions = {
+        'linear': linear_ramp,
+        'sigmoid': sigmoid_ramp,
+        'exponential': exponential_ramp,
+        'logistic': logistic_ramp
+    }
+    ramp_func = ramp_functions.get(ramp_type, logistic_ramp)
+    
     # Simulate trading
     all_trades = []
     
-    for date in trading_dates:
+    for day_idx, date in enumerate(trading_dates):
+        # Calculate normalized time (0-1) for ramp functions
+        t_normalized = day_idx / max(len(trading_dates) - 1, 1)
+        
+        # Calculate ramp factors if enabled
+        participation_ramp_factor = 1.0
+        volume_ramp_factor = 1.0
+        
+        if enable_ramp:
+            # Participation ramp: from start to end over specified days
+            participation_ramp_t = min(day_idx / max(participation_ramp_days, 1), 1.0)
+            participation_ramp_factor = ramp_func(
+                participation_ramp_t,
+                min_val=participation_ramp_start,
+                max_val=participation_ramp_end
+            )
+            
+            # Volume ramp: from start to end over specified days
+            volume_ramp_t = min(day_idx / max(volume_ramp_days, 1), 1.0)
+            volume_ramp_factor = ramp_func(
+                volume_ramp_t,
+                min_val=volume_ramp_start,
+                max_val=volume_ramp_end
+            )
+        
         # Determine participation rate for this day (higher on NFL Sundays)
-        day_participation = participation_rate
+        day_participation = participation_rate * participation_ramp_factor
         if date.weekday() == 6:  # Sunday
             day_participation *= 1.5  # More activity on NFL Sundays
         
         for gambler in gamblers:
+            # Check if miner is active (has joined the network)
+            if not gambler.is_active(date):
+                continue
+            
             # Check if gambler should trade today
+            # day_participation already includes the ramp factor
             if not gambler.should_trade_today(day_participation):
                 continue
             
             # Determine number of trades for this gambler today
-            num_trades_today = rng.poisson(gambler.profile.trading_frequency)
+            # Optionally scale trading frequency by ramp (traders trade more as they get comfortable)
+            trading_freq_multiplier = volume_ramp_factor if enable_ramp else 1.0
+            num_trades_today = rng.poisson(gambler.profile.trading_frequency * trading_freq_multiplier)
             
             for _ in range(num_trades_today):
                 market_id = rng.choice(markets)
-                trade = simulator.simulate_trade(gambler, market_id, date, base_odds, odds_sigma)
+                trade = simulator.simulate_trade(
+                    gambler, market_id, date, base_odds, odds_sigma,
+                    volume_ramp_factor=volume_ramp_factor
+                )
                 if trade:
                     all_trades.append(trade)
     
@@ -522,6 +755,15 @@ Examples:
   
   # Professional scenario with 50% general pool
   python gen_mock_data.py --miners 10 --days 60 --scenario professional-heavy --general-pool 0.5
+  
+  # Slow ramp-up scenario (subnet launch simulation)
+  python gen_mock_data.py --miners 20 --days 90 --enable-ramp --ramp-type logistic \
+    --onboarding-strategy exponential --onboarding-period-days 45 \
+    --participation-ramp-days 30 --volume-ramp-days 30
+  
+  # Gradual uniform onboarding
+  python gen_mock_data.py --miners 15 --days 60 --enable-ramp --onboarding-strategy uniform \
+    --onboarding-period-days 30
         """
     )
     
@@ -552,6 +794,30 @@ Examples:
                        help='Base participation rate (default: 0.25)')
     parser.add_argument('--general-pool', type=float, default=0.0, 
                        help='Percentage of miners in general pool (default: 0.0)')
+    
+    # Ramp parameters
+    parser.add_argument('--enable-ramp', action='store_true',
+                       help='Enable time-based ramp-up simulation (slow launch scenario)')
+    parser.add_argument('--ramp-type', type=str, default='logistic',
+                       choices=['linear', 'sigmoid', 'exponential', 'logistic'],
+                       help='Ramp function type (default: logistic)')
+    parser.add_argument('--participation-ramp-start', type=float, default=0.1,
+                       help='Starting participation multiplier (default: 0.1)')
+    parser.add_argument('--participation-ramp-end', type=float, default=1.0,
+                       help='Ending participation multiplier (default: 1.0)')
+    parser.add_argument('--participation-ramp-days', type=int, default=30,
+                       help='Days to ramp participation from start to end (default: 30)')
+    parser.add_argument('--volume-ramp-start', type=float, default=0.1,
+                       help='Starting volume multiplier (default: 0.1)')
+    parser.add_argument('--volume-ramp-end', type=float, default=1.0,
+                       help='Ending volume multiplier (default: 1.0)')
+    parser.add_argument('--volume-ramp-days', type=int, default=30,
+                       help='Days to ramp volume from start to end (default: 30)')
+    parser.add_argument('--onboarding-strategy', type=str, default='immediate',
+                       choices=['immediate', 'uniform', 'exponential', 'logistic'],
+                       help='How miners join the network (default: immediate)')
+    parser.add_argument('--onboarding-period-days', type=int, default=30,
+                       help='Days over which miners gradually join (default: 30)')
     
     # Profile distribution
     parser.add_argument('--profiles', type=str, 
@@ -600,7 +866,17 @@ Examples:
         odds_sigma=args.odds_sigma,
         participation_rate=args.participation,
         general_pool_percentage=args.general_pool,
-        seed=args.seed
+        seed=args.seed,
+        enable_ramp=args.enable_ramp,
+        ramp_type=args.ramp_type,
+        participation_ramp_start=args.participation_ramp_start,
+        participation_ramp_end=args.participation_ramp_end,
+        participation_ramp_days=args.participation_ramp_days,
+        volume_ramp_start=args.volume_ramp_start,
+        volume_ramp_end=args.volume_ramp_end,
+        volume_ramp_days=args.volume_ramp_days,
+        onboarding_strategy=args.onboarding_strategy,
+        onboarding_period_days=args.onboarding_period_days
     )
 
 if __name__ == "__main__":
