@@ -38,8 +38,8 @@ import time
 import secrets
 from constants import VOLUME_FEE
 
-#ALMANAC_API_URL = "https://almanac.market/api"
-ALMANAC_API_URL = "http://localhost:3001/api"
+ALMANAC_API_URL = "https://almanac.market/api"
+#ALMANAC_API_URL = "http://localhost:3001/api"
 POLYMARKET_CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
 # EIP-712 domain contract for Polymarket CTF Exchange
