@@ -223,17 +223,17 @@ def _display_outcomes_and_choose(market: dict):
     print("\nOutcomes:")
     for idx, o in enumerate(normalized, start=1):
         print(f"  {idx}) {o['name']} {_format_price(o.get('price'))}")
-    sel = input("\nSelect outcome to trade (or Enter to skip): ").strip()
+    sel = input("\nSelect outcome to trade (or Enter to cancel): ").strip()
     if not sel:
-        return (None, None, None)
+        return None  # Signal cancellation
     try:
         sel_idx = int(sel)
     except ValueError:
-        print("Invalid selection; skipping outcome selection.")
-        return (None, None)
+        print("Invalid selection; cancelling.")
+        return None  # Signal cancellation
     if sel_idx < 1 or sel_idx > len(normalized):
-        print("Selection out of range; skipping outcome selection.")
-        return (None, None, None)
+        print("Selection out of range; cancelling.")
+        return None  # Signal cancellation
     chosen = normalized[sel_idx - 1]
     return (chosen.get("name"), chosen.get("price"), chosen.get("tokenId"))
 
@@ -730,24 +730,36 @@ def search_markets():
         markets = _display_markets_for_event(chosen_event)
         if not markets:
             return
-        sel_m = input("\nChoose a market by number (or Enter to cancel): ").strip()
-        if not sel_m:
+        
+        # Auto-select if only one market, otherwise prompt
+        if len(markets) == 1:
+            SELECTED_MARKET = markets[0]
+            title = SELECTED_MARKET.get("title") or SELECTED_MARKET.get("question") or SELECTED_MARKET.get("name") or "Untitled"
+            market_id = SELECTED_MARKET.get("id") or SELECTED_MARKET.get("marketId") or SELECTED_MARKET.get("_id") or "unknown"
+            print(f"\nSelected market: {title} [{market_id}]")
+        else:
+            sel_m = input("\nChoose a market by number (or Enter to cancel): ").strip()
+            if not sel_m:
+                print("Cancelled.")
+                return
+            try:
+                sel_m_idx = int(sel_m)
+            except ValueError:
+                print("Invalid selection.")
+                return
+            if sel_m_idx < 1 or sel_m_idx > len(markets):
+                print("Selection out of range.")
+                return
+            SELECTED_MARKET = markets[sel_m_idx - 1]
+            title = SELECTED_MARKET.get("title") or SELECTED_MARKET.get("question") or SELECTED_MARKET.get("name") or "Untitled"
+            market_id = SELECTED_MARKET.get("id") or SELECTED_MARKET.get("marketId") or SELECTED_MARKET.get("_id") or "unknown"
+            print(f"\nSelected market: {title} [{market_id}]")
+
+        result = _display_outcomes_and_choose(SELECTED_MARKET)
+        if result is None:
             print("Cancelled.")
             return
-        try:
-            sel_m_idx = int(sel_m)
-        except ValueError:
-            print("Invalid selection.")
-            return
-        if sel_m_idx < 1 or sel_m_idx > len(markets):
-            print("Selection out of range.")
-            return
-        SELECTED_MARKET = markets[sel_m_idx - 1]
-        title = SELECTED_MARKET.get("title") or SELECTED_MARKET.get("question") or SELECTED_MARKET.get("name") or "Untitled"
-        market_id = SELECTED_MARKET.get("id") or SELECTED_MARKET.get("marketId") or SELECTED_MARKET.get("_id") or "unknown"
-        print(f"\nSelected market: {title} [{market_id}]")
-
-        chosen_outcome_name, chosen_outcome_price, chosen_token_id = _display_outcomes_and_choose(SELECTED_MARKET)
+        chosen_outcome_name, chosen_outcome_price, chosen_token_id = result
         # Go straight to placing an order (single confirmation flow is order inputs)
         _place_order_now(SELECTED_MARKET, chosen_outcome_name, chosen_token_id)
     except Exception as exc:
@@ -847,7 +859,7 @@ def interactive_setup():
             except Exception as exc:
                 print(f"Failed to generate credentials: {exc}")
         elif choice == "3":
-            print("Goodbye.")
+            print("Ciao!")
             break
         else:
             print("Invalid choice. Please enter 1, 2, or 3.\n")
