@@ -273,7 +273,7 @@ def _place_order_now(market: dict, chosen_outcome_name: str | None = None, chose
             return
         size_str = size_str or "1"
         
-        price_str = input("Limit price (0-1/c) [0.01]: ").strip()
+        price_str = input("Price (0-1/c) [0.01]: ").strip()
         if price_str.lower() == "c":
             print("Order cancelled.")
             return
@@ -296,16 +296,18 @@ def _place_order_now(market: dict, chosen_outcome_name: str | None = None, chose
     
     # Order type input with cancel option
     print("\nOrder Type:")
-    print("  GTC - Good Till Canceled: Limit order remains active until filled or cancelled")
     print("  FOK - Fill Or Kill: Market Order must be filled immediately or it's cancelled")
-    order_type_input = input("Order type (gtc/fok/c) [gtc]: ").strip().upper()
+    print("  FAK - Fill And Kill: Market Order will be filled immediately with what is available and the rest cancelled")
+    # GTC and GTD are not supported yet
+    #print("  GTC - Good Till Canceled: Limit order remains active until filled or cancelled")
+    order_type_input = input("Order type (fok/fak/c) [fok]: ").strip().upper()
     if order_type_input == "C":
         print("Order cancelled.")
         return
-    order_type = order_type_input or "GTC"
-    if order_type not in ("GTC", "FOK"):
-        print("Order type must be 'GTC' or 'FOK'. Using default 'GTC'.")
-        order_type = "GTC"
+    order_type = order_type_input or "FOK"
+    if order_type not in ("FOK", "FAK"):
+        print("Order type must be 'FOK' or 'FAK'. Using default 'FOK'.")
+        order_type = "FOK"
     
     side_upper = "BUY" if side == "buy" else "SELL"
     notional = size * price
@@ -486,7 +488,7 @@ def place_order(
     side_upper: str,
     size: float,
     price: float,
-    order_type: str = "GTC",
+    order_type: str = "FOK",
     chosen_outcome_name: str | None = None,
     chosen_token_id: str | None = None,
 ):
@@ -501,7 +503,7 @@ def place_order(
       - marketId: string (required)
       - tokenId: string (optional)
       - side: "BUY" | "SELL" (optional)
-      - orderType: "GTC" | "FOK" | "GTD" (optional; default "GTC")
+      - orderType: "FOK" | "FAK" (optional; default "FOK"; "GTC" and "GTD" are not supported yet)
       - price: float between 0.01 and 0.99 (optional)
       - size: float >= POLYMARKET_MIN_ORDER (optional)
       - signature: string (optional)
