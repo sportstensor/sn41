@@ -49,7 +49,7 @@ Sportstensor fixes this by:
 - Miners generate **informative probability signals** by trading on Almanac, which routes Polymarket CLOB orders through the miner’s proxy wallet.  
 - Every trade becomes a scored prediction within the **Almanac Scoring Engine**, which evaluates accuracy, ROI, timing, and informational value.  
 - Miners may use **manual strategies, models, or automated systems**—the scoring is model-agnostic and purely performance-based.  
-- High-signal miners earn the largest share of **daily USDC emissions** based on:  
+- High-signal miners earn the largest share of **daily Alpha Token emissions** based on:  
   - Truthful Flow contribution  
   - Informational Efficiency  
   - Volume-adjusted consistency  
@@ -68,7 +68,7 @@ Sportstensor fixes this by:
 
 - Scoring runs **hourly** in the background, always computing rewards for the **previous epoch** while updating weights for the current one.  
 - Epochs follow 24-hour windows, and a **decaying memory function** favors recent performance.  
-- Validators publish final weights using the scoring output, directly influencing miner TAO rewards.  
+- Validators publish final weights using the scoring output, directly influencing miner rewards.  
 - For implementation details, reference the scoring engine in `scoring.py` and the official docs.
 
 ---
@@ -152,7 +152,43 @@ Enable with:
 export WANDB_API_KEY=<your_key>
 ```
 
-CONTINUE HERE
+### Setup
+
+Clone and enter the repo:
+```bash 
+git clone https://github.com/sportstensor/sn41/
+cd sn41
+```
+Install pm2 (if not already installed).
+
+Install Python dependencies:
+```bash 
+pip install -r requirements.txt
+```
+
+### Run Auto-Updating Validator with PM2 (recommended)
+
+```bash 
+pm2 start vali_auto_update.sh --name sn41-validator -- \
+    --netuid 41 \
+    --wallet.name {wallet} \
+    --wallet.hotkey {hotkey} \
+    --axon.port {port} \
+    --logging.debug
+```
+
+
+### Run Basic Validator with PM2
+
+```bash 
+pm2 start validator.py --name sn41-validator -- \
+    --netuid 41 \
+    --wallet.name {wallet} \
+    --wallet.hotkey {hotkey} \
+    --axon.port {port} \
+    --logging.debug
+```
+
 
 ## Environments
 
