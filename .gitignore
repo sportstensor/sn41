@@ -1,6 +1,7 @@
 __pycache__/
 venv/
 
+api_trading.env
 storage.env
 validator_state_*.json
 
