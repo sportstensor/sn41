@@ -422,7 +422,7 @@ class Validator:
                     # Validate the miner profiles
                     miner_profiles = {}
                     miners_to_penalize = []
-                    if self.config.subtensor.network != "test":
+                    if self.config.use_synthetic_data is False:
                         if 'miner_profiles' in miner_history:
                             miner_profiles = miner_history['miner_profiles']
                         for miner_uid in miner_profiles.keys():
@@ -437,14 +437,14 @@ class Validator:
                             
                             # Get and check the miner metadata from the metadata manager
                             miner_metadata = self.get_miner_metadata(miner_uid)
-                            if miner_metadata is None or miner_metadata["polymarket_id"] is None:
+                            if miner_metadata is None:
                                 bt.logging.warning(f"❌ Miner {miner_uid} has no metadata defined. Setting score to 0.")
                                 miners_to_penalize.append(miner_uid)
                                 continue
                             
                             # Check if the miner profile id contains the metadata polymarket id as we only save partial polymarket ids to the blockchain
-                            if miner_metadata["polymarket_id"] not in miner_profiles[miner_uid]:
-                                bt.logging.warning(f"❌ Miner {miner_uid} polymarket ids do not match. {miner_metadata['polymarket_id']} not found in profile id. Setting score to 0.")
+                            if miner_metadata not in miner_profiles[miner_uid]:
+                                bt.logging.warning(f"❌ Miner {miner_uid} polymarket ids do not match. {miner_metadata} not found in profile id. Setting score to 0.")
                                 miners_to_penalize.append(miner_uid)
                                 continue
 
