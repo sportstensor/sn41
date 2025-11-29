@@ -381,7 +381,7 @@ def build_epoch_history(
             
             # Calculate metrics
             #fee = volume * VOLUME_FEE
-            fee = trade["actual_fees"]
+            fee = trade["actual_fees"] if trade["actual_fees"] is not None else 0.0
 
             # Always collect fees for all trades, even if the trade is not reward eligible
             fees_prev[epoch_idx, col_idx] += fee
