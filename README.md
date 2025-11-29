@@ -96,7 +96,7 @@ You must have a Bittensor wallet and a registered UID on the subnet.
    - Install the Bittensor wallet extension  
    - Import the coldkey tied to your miner UID  
    - Link wallet in Almanac settings  
-4. Connect Polymarket credentials if required (via Trading Settings)
+4. Connect Polymarket credentials (via Trading Settings)
 
 #### Miner Metadata Registration
 1. Clone the repository:
