@@ -2,7 +2,7 @@
 <div align="center">
 
 ```
-                  $$$$$$\  $$\       $$\      $$\  $$$$$$\  $$\   $$\  $$$$$$\   $$$$$$\  
+                   $$$$$$\  $$\       $$\      $$\  $$$$$$\  $$\   $$\  $$$$$$\   $$$$$$\  
                   $$  __$$\ $$ |      $$$\    $$$ |$$  __$$\ $$$\  $$ |$$  __$$\ $$  __$$\ 
                   $$ /  $$ |$$ |      $$$$\  $$$$ |$$ /  $$ |$$$$\ $$ |$$ /  $$ |$$ /  \__|
                   $$$$$$$$ |$$ |      $$\$$\$$ $$ |$$$$$$$$ |$$ $$\$$ |$$$$$$$$ |$$ |      
@@ -69,8 +69,7 @@ The Sportstensor subnet is designed to incentivize the discovery of competitive 
 
 ### Setting up a Miner
 #### Requirements
-- Polymarket account
-- Almanac account
+- Almanac account integrated with Polymarket
 - Almanac account connected to registered Bittensor coldkey
 - Python 3.10+
 - Pip
@@ -106,7 +105,7 @@ Miners are more than welcome to trade directly on [Almanac](https://almanac.mark
 #### Miner Trading with API
 If you would like to programmatically trade on Almanac, you will need to:
 - Complete all the setup steps defined above
-- Integrate API trading logic into your workflow.
+- Integrate API trading logic into your workflow
 
 --- ADD INFO ABOUT THE API TRADING LOGIC ---
 
