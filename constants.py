@@ -39,4 +39,5 @@ TOTAL_MINER_ALPHA_PER_DAY = 2952 # 7200 alpha per day for entire subnet * 0.41 (
 BURN_UID = 210
 # Subnet owner excess miner weight UID
 EXCESS_MINER_WEIGHT_UID = 0
-EXCESS_MINER_MIN_WEIGHT = 0.0001
+EXCESS_MINER_MIN_WEIGHT = 0.00001
+EXCESS_MINER_TAKE_PERCENTAGE = 0.1 # percentage of the excess miner weight that is set to EXCESS_MINER_WEIGHT_UID. rest goes to BURN_UID.

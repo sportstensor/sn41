@@ -101,6 +101,7 @@ from constants import (
   BURN_UID,
   EXCESS_MINER_WEIGHT_UID,
   EXCESS_MINER_MIN_WEIGHT,
+  EXCESS_MINER_TAKE_PERCENTAGE,
   MAX_EPOCH_BUDGET_PERCENTAGE_FOR_BOOST,
   MINER_POOL_BUDGET_BOOST_PERCENTAGE,
   MINER_POOL_WEIGHT_BOOST_PERCENTAGE
@@ -1221,31 +1222,54 @@ def calculate_weights(miners_scores: Dict[str, Any], general_pool_scores: Dict[s
         general_pool_weight = (total_general_pool_tokens / total_epoch_budget)
         #bt.logging.info(f"General pool BURN_UID weight: {general_pool_weight:.4f} (dynamic weighting: {total_general_pool_tokens:,.2f} / {total_epoch_budget:,.2f})")
         print(f"General pool BURN_UID weight: {general_pool_weight:.4f} (dynamic weighting: {total_general_pool_tokens:,.2f} / {total_epoch_budget:,.2f})")
+
+    miner_pool_weights = sum(miner_weights.values())
+    #bt.logging.info(f"Miner pool weights: {miner_pool_weights:.4f}")
+    print(f"Miner pool weights: {miner_pool_weights:.4f}")
+    
+    # Set initial burn weight to the general pool weight so our total allocated weight is 1.0
     miner_weights[BURN_UID] = general_pool_weight
 
     # Step 3: Calculate total allocated weight and excess
     total_allocated_weight = sum(miner_weights.values())
     excess_weight = 1.0 - total_allocated_weight
-    #bt.logging.info(f"Subtotal allocated weight: {total_allocated_weight:.4f}")
-    print(f"Subtotal allocated weight: {total_allocated_weight:.4f} (({total_miner_pool_tokens:,.2f} + {total_general_pool_tokens:,.2f}) / {total_epoch_budget:,.2f})")
+    #bt.logging.info(f"Subtotal allocated weight: {total_allocated_weight:.4f} ({miner_pool_weights:,.4f} + {general_pool_weight:,.4f}) or (({total_miner_pool_tokens:,.2f} + {total_general_pool_tokens:,.2f}) / {total_epoch_budget:,.2f})")
+    print(f"Subtotal allocated weight: {total_allocated_weight:.4f} ({miner_pool_weights:,.4f} + {general_pool_weight:,.4f}) or (({total_miner_pool_tokens:,.2f} + {total_general_pool_tokens:,.2f}) / {total_epoch_budget:,.2f})")
 
     # If we have excess weight and the miner pool weight boost percentage is greater than 0, we will boost the miner pool weights by the percentage.
     if excess_weight > 0 and MINER_POOL_WEIGHT_BOOST_PERCENTAGE > 0:
-        # Boost the miner pool weights by the percentage
-        miner_weights = {uid: weight * (1 + MINER_POOL_WEIGHT_BOOST_PERCENTAGE) for uid, weight in miner_weights.items()}
-        #bt.logging.info(f"Boosted miner pool weights by {MINER_POOL_WEIGHT_BOOST_PERCENTAGE * 100:.2f}%")
-        print(f"Boosted miner pool weights by {MINER_POOL_WEIGHT_BOOST_PERCENTAGE * 100:.2f}%")
+        # Boost the miner pool weights by the percentage but don't boost the burn weight.
+        miner_weights = {uid: weight * (1 + MINER_POOL_WEIGHT_BOOST_PERCENTAGE) if uid != BURN_UID else weight for uid, weight in miner_weights.items()}
+        miner_pool_weights = sum(weight for uid, weight in miner_weights.items() if uid != BURN_UID)
+        #bt.logging.info(f"Boosted miner pool weights by {MINER_POOL_WEIGHT_BOOST_PERCENTAGE * 100:.2f}% to {miner_pool_weights:,.4f}")
+        print(f"Boosted miner pool weights by {MINER_POOL_WEIGHT_BOOST_PERCENTAGE * 100:.2f}% to {miner_pool_weights:,.4f}")
         # Recalculate the total allocated weight and excess weight
         total_allocated_weight = sum(miner_weights.values())
         excess_weight = 1.0 - total_allocated_weight
-    
+
+    # Calculate the excess weight and burn weight
+    # Burn weight is what is left after excess weight, including the general pool weight which is always burned.
+    burn_weight = excess_weight - (excess_weight * EXCESS_MINER_TAKE_PERCENTAGE)
+    #burn_weight = max(burn_weight, general_pool_weight)
+    burn_weight += general_pool_weight
+    # Assign the burn weight to BURN_UID
+    miner_weights[BURN_UID] = burn_weight
+
+    # Calculate the excess weight that is not burned.
+    excess_weight = excess_weight * EXCESS_MINER_TAKE_PERCENTAGE
     # Assign excess weight to EXCESS_MINER_WEIGHT_UID, but ensure it is at least EXCESS_MINER_MIN_WEIGHT
     miner_weights[EXCESS_MINER_WEIGHT_UID] = max(excess_weight, EXCESS_MINER_MIN_WEIGHT)
     
-    #bt.logging.info(f"Total allocated weight: {total_allocated_weight:.4f}")
-    print(f"Total allocated weight: {total_allocated_weight:.4f}")
-    #bt.logging.info(f"Excess weight assigned to EXCESS_MINER_WEIGHT_UID: {miner_weights[EXCESS_MINER_WEIGHT_UID]:.4f}")
-    print(f"Excess weight assigned to EXCESS_MINER_WEIGHT_UID: {miner_weights[EXCESS_MINER_WEIGHT_UID]:.4f}")
+    #bt.logging.info(f"Total allocated weight: {total_allocated_weight:.4f} ({miner_pool_weights:,.4f} + {general_pool_weight:,.4f})")
+    print(f"Total allocated weight: {total_allocated_weight:.4f} ({miner_pool_weights:,.4f} + {general_pool_weight:,.4f})")
+    #bt.logging.info(f"Excess weight assigned to EXCESS_MINER_WEIGHT_UID: {miner_weights[EXCESS_MINER_WEIGHT_UID]:.5f}")
+    print(f"Excess weight assigned to EXCESS_MINER_WEIGHT_UID: {miner_weights[EXCESS_MINER_WEIGHT_UID]:.5f} ({EXCESS_MINER_TAKE_PERCENTAGE * 100:.0f}% of excess weight)")
+    #bt.logging.info(f"Excess weight assigned to BURN_UID: {(burn_weight - general_pool_weight):,.4f}")
+    print(f"Excess weight assigned to BURN_UID: {(burn_weight - general_pool_weight):,.4f} ({(1 - EXCESS_MINER_TAKE_PERCENTAGE) * 100:.0f}% of excess weight)")
+    #bt.logging.info(f"Burn weight assigned to BURN_UID: {miner_weights[BURN_UID]:.4f} ({general_pool_weight:,.4f} + {(burn_weight - general_pool_weight):,.4f})")
+    print(f"Burn weight assigned to BURN_UID: {miner_weights[BURN_UID]:.4f} ({general_pool_weight:,.4f} + {(burn_weight - general_pool_weight):,.4f})")
+    #bt.logging.info(f"Final weights: {miner_pool_weights:,.4f} (miner pool) + {general_pool_weight:,.4f} (general pool) + {(burn_weight - general_pool_weight):,.4f} (burn) + {miner_weights[EXCESS_MINER_WEIGHT_UID]:,.5f} (excess) = {sum(miner_weights.values()):,.2f}")
+    print(f"Final weights: {miner_pool_weights:,.4f} (miner pool) + {general_pool_weight:,.4f} (general pool) + {(burn_weight - general_pool_weight):,.4f} (burn) + {miner_weights[EXCESS_MINER_WEIGHT_UID]:,.5f} (excess) == {sum(miner_weights.values()):,.2f}")
 
     # Step 4: Convert weight dictionary to array format for Bittensor
     # Create weights array matching the metagraph UIDs
