@@ -1,77 +1,44 @@
 """
-scoring.py  —  Candidate implementation with deep comments
+scoring.py — Performance-Based Incentive Mechanism for Prediction Market Traders
 
-Purpose (plain English):
-------------------------
-This file implements the *lexicographic convex program* you designed:
+This module implements a two-phase optimization system that rewards traders (miners) based on 
+their historical trading performance. The mechanism distributes a fixed budget among eligible 
+participants, prioritizing those who demonstrate consistent profitability and trading volume.
 
-  Phase 1 (primary goal):      Maximize routed volume T
-  Phase 2 (secondary goal):    Minimize payout cost C while keeping T ≈ T1
+HOW IT WORKS:
+-------------
+The system tracks trading activity over a rolling 30-day window, organizing trades into daily 
+epochs. For each epoch, it:
 
-…under these constraints:
-  - Budget cap                         (sum payouts <= Budget)
-  - Payout-to-volume cap (kappa_bar)   (sum payouts <= kappa_bar * T)
-  - Diversity cap per miner            (miner_i share <= rho_cap * T)
-  - Eligibility                        (only miners above ROI_min & V_min can get x > 0)
-  - Ramp (smoothness)                  (x - x_prev bounded each epoch)
-  - Bounds                             (0 <= x <= 1)
+1. Calculates Performance Metrics:
+   - ROI (Return on Investment): Profit divided by trading volume
+   - Qualified Volume: Volume from winning trades (after fees)
+   - Trailing Performance: Historical performance across all epochs
 
-Key modeling choices:
----------------------
-- Decision variable x[i]  ∈ [0,1] is the fraction of miner i’s "epoch" we fund this epoch.
-- We approximate miner i’s *epoch* by their last-epoch qualified volume v_prev[i].
-- So the routed volume contributed by miner i this epoch ≈ v_prev[i] * x[i].
-- Total routed volume T = sum_i v_prev[i] * x[i].
+2. Applies Eligibility Gates:
+   - Minimum ROI threshold (prevents rewarding unprofitable traders)
+   - Minimum volume requirement (ensures meaningful participation)
+   - Build-up period: Traders must demonstrate consistent activity over multiple epochs
 
-- Payout cost vector c[i] = v_prev[i] * max(roi_prev[i], 0.0).
-  *Why this is OK:* We want higher ROI miners to cost more per funded dollar so that
-  Phase 2 has a meaningful “minimize cost” tie-break. Eligibility already prevents
-  negative or tiny ROI miners from flowing through; clamping to >= 0 keeps the LP simple.
+3. Runs Two-Phase Optimization:
+   Phase 1: Maximizes the total qualified volume that can be funded within budget constraints
+   Phase 2: Redistributes payouts to favor higher-ROI traders while maintaining volume targets
 
-- Diversity (rho_cap): Each miner’s share of volume is limited:
-      v_prev[i] * x[i] <= rho_cap * T
-  This prevents a single miner from dominating the flow.
+4. Allocates Tokens:
+   - Converts optimized scores into token weights
+   - Distributes rewards proportionally based on funded volume and signal strength (ROI)
+   - Enforces diversity caps to prevent any single trader from dominating
 
-- Ramp (ramp): Limits how much each x[i] can move relative to last epoch:
-      -ramp <= x[i] - x_prev[i] <= ramp
-  This keeps flow changes smooth. We set a single global ramp scalar from HHI.
+KEY FEATURES:
+-------------
+- Dual Pool System: Separate scoring for registered miners vs. general pool traders
+- Volume Decay: Recent activity weighted more heavily than older trades
+- Smooth Transitions: Ramp constraints prevent sudden allocation changes
+- Budget Management: Ensures total payouts never exceed available budget
+- Performance Gating: Only profitable, active traders receive rewards
 
-- HHI-based ramp: ramp = sum(share^2), where share = All_volumes / sum(All_volumes).
-  Intuition: If the field is concentrated (few big miners), ramp is higher (system can
-  pivot faster). If broad (many similar miners), ramp is lower (slower changes, smoother).
-
-Data & defaults (for demo):
----------------------------
-- Budget, Volume_prev, Total_volume, All_volumes, ROI_min, V_min, x_prev, roi_prev, v_prev.
-- You can wire these to real epoch data in production.
-- ECOS solver is used (install: pip install ecos). If missing, use SCS.
-
-Outputs:
---------
-- Phase 1: T1*, x1*, and duals (shadow prices for each constraint).
-- Phase 2: C*, x2*, T2, and duals.
-- Payouts P[i] = c[i] * x_opt[i] (opt from Phase 2, else Phase 1).
-- Printed dual “scoreboard” table with Greek symbols, names, and values.
-
-Reading the duals (dashboard idea):
------------------------------------
-- λ_B   (lambda_B):     how tight the budget is.
-- λ_κ   (lambda_k):     how tight the payout-to-volume ratio is.
-- λ_i   (lambda_i[i]):  which miner i’s diversity cap is binding.
-- μ     (mu):           whether eligibility is biting (x <= eligible).
-- ρ⁺/ρ⁻ (rho_plus/minus): how much ramp (smoothness) is costing us (upper/lower).
-- ν⁺/ν⁻ (nu_plus/minus): whether x is stuck against [0,1] bounds.
-- α     (alpha):        link constraint T = v·x (technical dual).
-- η     (eta, Phase 2): cost of forcing T ≥ (1−ε) T1 (locking max volume).
-
-IMPORTANT UNITS / INTERPRETATION:
----------------------------------
-- roi_prev is a *fraction*, e.g., 0.05 means 5% ROI. Do NOT pass 5 or 100 for 5%.
-- v_prev is in dollars (or any unit of qualified volume).
-- c has units of payout (token) per unit x (since x is a fraction of the epoch);
-  c @ x gives total payout tokens.
-- T is in the same units as volume (v_prev @ x).
-
+The system is designed to incentivize high-quality trading signals while maintaining fairness 
+and preventing gaming through volume requirements and historical performance tracking.
 """
 
 import numpy as np
@@ -112,7 +79,7 @@ def score_miners(
     all_hotkeys: List[str],
     trading_history: List[Dict[str, Any]],
     current_epoch_budget: float,
-    verbose: bool = True,
+    verbose: bool = False,
     target_epoch_idx: int = None
 ):
     """
@@ -190,9 +157,10 @@ def score_miners(
     gp_fees = np.sum(general_pool_history["fees_prev"][epoch_idx]) if general_pool_history["n_entities"] > 0 else 0.0
     current_epoch_fees_collected = miner_fees + gp_fees
     
-    print(f"Current epoch fees collected: {current_epoch_fees_collected:,.2f}")
-    print(f"-> Miner pool fees: {miner_fees:,.2f}")
-    print(f"-> General pool fees: {gp_fees:,.2f}")
+    if verbose:
+        print(f"Current epoch fees collected: {current_epoch_fees_collected:,.2f}")
+        print(f"-> Miner pool fees: {miner_fees:,.2f}")
+        print(f"-> General pool fees: {gp_fees:,.2f}")
 
     if ENABLE_STATIC_WEIGHTING:
         # Calculate the budget for each pool based on our constants that reallocate the total fees collected to the miners and general pool.
@@ -554,7 +522,6 @@ def score_with_epochs(
     """
     kappa_bar = compute_joint_kappa_from_history(epoch_history)
 
-    # @TODO: verify with Stephen (currently not in use)
     x_prev = np.zeros(n_entities)
     last_duals = None
     last_alloc = np.zeros(n_entities)
@@ -583,7 +550,7 @@ def score_with_epochs(
         # --- CONSTRAINT SETTINGS ---
         "roi_min": roi_min,                         # minimum roi constraint
         "v_min": volume_min,                        # minimum volume constraint
-        "x_prev": x_prev,                           # allocations this epoch. @TODO: verify with Stephen (currently not in use)
+        "x_prev": x_prev,                           # allocations this epoch.
         "kappa_bar": kappa_bar,                     # payout rate
         "ramp": RAMP,                               # allocation delta rate
         "rho_cap": RHO_CAP,                         # max allocation per miner

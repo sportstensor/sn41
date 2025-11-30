@@ -4,7 +4,7 @@ ROLLING_HISTORY_IN_DAYS = 30
 # Constants for the scoring function
 VOLUME_FEE = 0.01
 ROI_MIN = 0.0
-VOLUME_MIN = 10
+VOLUME_MIN = 1
 VOLUME_DECAY = 0.9
 RAMP = 0.1 # originally 0.1
 RHO_CAP = 0.1 # originally 0.1
