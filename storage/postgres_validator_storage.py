@@ -1,3 +1,15 @@
+"""
+This module is used to store the scores and weights in a PostgreSQL database.
+
+This is optional and only used for storing the scores and weights in a PostgreSQL database. Meant for Sportstensor's validator use.
+
+Requirements in addition to requirements.txt:
+- psycopg2-binary
+- python-dotenv
+
+pip install psycopg2-binary python-dotenv
+"""
+
 import os
 import contextlib
 from typing import Optional
