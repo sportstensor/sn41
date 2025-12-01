@@ -112,7 +112,7 @@ You must have a Bittensor wallet and a registered UID on the subnet.
 - Miner registration: https://docs.learnbittensor.org/miners  
 
 #### Almanac and Polymarket Setup
-1. Go to **https://almanac.market**  
+1. Go to **https://beta.almanac.market**  
 2. Create an account
     - Deploy safe wallet
     - Sign all approvals
@@ -140,7 +140,7 @@ python miner.py
 
 ## Miner Trading with Almanac dApp
 
-Once linked, miners can trade directly on **https://almanac.market**.  
+Once linked, miners can trade directly on **https://beta.almanac.market**.  
 Validators automatically detect trades, compute scores, and distribute emissions.
 
 *Note: Miners trading directly on the app don't need to connect their Bittensor wallet after initially linking account.
