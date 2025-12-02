@@ -4,7 +4,7 @@ import time
 import threading
 from typing import Dict, List, Optional, Set
 import bittensor as bt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 class MetadataManager:
@@ -108,7 +108,7 @@ class MetadataManager:
     def update_uid_metadata(self, uid: int, polymarket_id: Optional[str], block_number: int):
         """Update or add metadata for a UID."""
         with self.lock:
-            timestamp = datetime.now().isoformat()
+            timestamp = datetime.now(timezone.utc).isoformat()
             # Find existing entry
             for i, entry in enumerate(self.metadata_state["metadata"]):
                 if entry["uid"] == uid:
@@ -131,13 +131,14 @@ class MetadataManager:
         if not self.metagraph:
             return []
         
-        current_time = datetime.now()
+        current_time = datetime.now(timezone.utc)
         uids_to_update = []
         
         # Get all non-validator UIDs
         all_uids = set(self.metagraph.uids.tolist())
         
         # Get validator UIDs by checking which UIDs have validator permits
+        """
         validator_uids = set()
         try:
             # Query validator permits for all UIDs in the subnet
@@ -158,10 +159,11 @@ class MetadataManager:
             bt.logging.warning(f"Could not query validator permits: {e}")
             # Fallback: assume no validators if we can't query
             validator_uids = set()
+        """
         
-        miner_uids = all_uids - validator_uids
+        #miner_uids = all_uids - validator_uids
         
-        for uid in miner_uids:
+        for uid in all_uids:
             uid_info = self.get_uid_info(uid)
             
             # Update if:
@@ -176,6 +178,9 @@ class MetadataManager:
                     last_updated_str = uid_info.get("last_updated")
                     if last_updated_str:
                         last_updated = datetime.fromisoformat(last_updated_str)
+                        # Make timezone-aware if naive (assume UTC for backward compatibility)
+                        if last_updated.tzinfo is None:
+                            last_updated = last_updated.replace(tzinfo=timezone.utc)
                         time_since_update = (current_time - last_updated).total_seconds()
                         
                         if time_since_update > self.update_interval:
@@ -189,7 +194,7 @@ class MetadataManager:
             if should_update:
                 uids_to_update.append(uid)
         
-        bt.logging.debug(f"Found {len(uids_to_update)} UIDs to update out of {len(miner_uids)} total miners")
+        bt.logging.debug(f"Found {len(uids_to_update)} UIDs to update out of {len(all_uids)} total miners")
         return uids_to_update
     
     def process_batch(self, uid_batch: List[int], current_block: int):
@@ -242,7 +247,7 @@ class MetadataManager:
                     time.sleep(self.batch_delay)
             
             # Update last full sync timestamp
-            self.metadata_state["last_full_sync"] = datetime.now().isoformat()
+            self.metadata_state["last_full_sync"] = datetime.now(timezone.utc).isoformat()
             self.save_state()
             
             bt.logging.info(f"Completed metadata update for {len(uids_to_update)} UIDs")

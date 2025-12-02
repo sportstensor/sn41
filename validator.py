@@ -36,8 +36,8 @@ class Validator:
 
         self.trading_history_endpoint = "https://api.almanac.market/api/v1/trading/trading-history"
         if self.config.subtensor.network == "test":
-            #self.trading_history_endpoint = "https://test-api.almanac.market/api/v1/trading/trading-history"
-            self.trading_history_endpoint = "http://localhost:3001/api/v1/trading/trading-history"
+            self.trading_history_endpoint = "https://test-api.almanac.market/api/v1/trading/trading-history"
+            #self.trading_history_endpoint = "http://localhost:3001/api/v1/trading/trading-history"
         self.rolling_history_in_days = ROLLING_HISTORY_IN_DAYS
         self.trading_history_batch_limit = 1000
         # Set up auto update.
@@ -360,14 +360,14 @@ class Validator:
         # The Main Validation Loop.
         bt.logging.info("=========== STARTING SN41 VALIDATOR LOOP ===========")
         while True:
-            current_time = datetime.datetime.utcnow()
+            current_time = datetime.datetime.now(datetime.timezone.utc)
             minutes = current_time.minute
 
             # Get the current block number and the last update time.
             try:
                 should_score_and_set_weights = False
                 # Score and set weights every hour on the hour
-                if minutes == 48:
+                if minutes == 0:
                     should_score_and_set_weights = True
 
                 # If metadata manager last full sync is more than 2 hours ago, skip scoring and setting weights
@@ -375,6 +375,9 @@ class Validator:
                 last_full_sync_str = metadata_stats.get("last_full_sync")
                 if last_full_sync_str:
                     last_full_sync = datetime.datetime.fromisoformat(last_full_sync_str)
+                    # Make timezone-aware if naive (assume UTC for backward compatibility)
+                    if last_full_sync.tzinfo is None:
+                        last_full_sync = last_full_sync.replace(tzinfo=datetime.timezone.utc)
                     if last_full_sync < current_time - datetime.timedelta(hours=2) and self.config.subtensor.network != "test":
                         bt.logging.warning("Metadata manager last full sync is more than 2 hours ago. Skipping scoring and setting weights.")
                         should_score_and_set_weights = False
