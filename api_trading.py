@@ -161,14 +161,11 @@ def _display_markets_for_event(event: dict) -> list:
     for idx, m in enumerate(markets, start=1):
         title = m.get("title") or m.get("question") or m.get("name") or "Untitled"
         market_id = m.get("id") or m.get("marketId") or m.get("_id") or "unknown"
-        # Extract neg_risk field (supports both snake_case and camelCase)
-        neg_risk = m.get("neg_risk") or m.get("negRisk")
-        neg_risk_str = f" (negRisk: {str(neg_risk).lower()})" if neg_risk is not None else ""
         summary = _extract_outcomes_summary(m)
         if summary:
-            print(f"  {idx}) {title} [{market_id}]{neg_risk_str}\n      {summary}")
+            print(f"  {idx}) {title} [{market_id}]\n      {summary}")
         else:
-            print(f"  {idx}) {title} [{market_id}]{neg_risk_str}")
+            print(f"  {idx}) {title} [{market_id}]")
     return markets
 
 def _display_outcomes_and_choose(market: dict):
@@ -750,9 +747,7 @@ def search_markets():
             SELECTED_MARKET = markets[0]
             title = SELECTED_MARKET.get("title") or SELECTED_MARKET.get("question") or SELECTED_MARKET.get("name") or "Untitled"
             market_id = SELECTED_MARKET.get("id") or SELECTED_MARKET.get("marketId") or SELECTED_MARKET.get("_id") or "unknown"
-            neg_risk = SELECTED_MARKET.get("neg_risk") or SELECTED_MARKET.get("negRisk")
-            neg_risk_str = f" (negRisk: {str(neg_risk).lower()})" if neg_risk is not None else ""
-            print(f"\nSelected market: {title} [{market_id}]{neg_risk_str}")
+            print(f"\nSelected market: {title} [{market_id}]")
         else:
             sel_m = input("\nChoose a market by number (or Enter to cancel): ").strip()
             if not sel_m:
@@ -769,9 +764,7 @@ def search_markets():
             SELECTED_MARKET = markets[sel_m_idx - 1]
             title = SELECTED_MARKET.get("title") or SELECTED_MARKET.get("question") or SELECTED_MARKET.get("name") or "Untitled"
             market_id = SELECTED_MARKET.get("id") or SELECTED_MARKET.get("marketId") or SELECTED_MARKET.get("_id") or "unknown"
-            neg_risk = SELECTED_MARKET.get("neg_risk") or SELECTED_MARKET.get("negRisk")
-            neg_risk_str = f" (negRisk: {str(neg_risk).lower()})" if neg_risk is not None else ""
-            print(f"\nSelected market: {title} [{market_id}]{neg_risk_str}")
+            print(f"\nSelected market: {title} [{market_id}]")
 
         result = _display_outcomes_and_choose(SELECTED_MARKET)
         if result is None:
