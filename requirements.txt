@@ -9,3 +9,6 @@ requests
 
 cvxpy
 ecos
+
+py_clob_client
+dotenv
