@@ -569,7 +569,7 @@ def place_order(
             # use BigInt(Date.now()) for salt
             salt = int(time.time() * 1000)
             
-            # Match TypeScript logic: size is shares, apply ±0.01 price adjustment for leeway
+            # Size is shares, apply ±0.01 price adjustment for leeway
             # This ensures effective price is slightly worse to prevent rejection due to rounding
             if side_num == 0:  # BUY
                 # For BUY: size is shares we want to receive
