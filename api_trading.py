@@ -569,6 +569,22 @@ def start_trading_flow():
     """
     global CURRENT_SESSION, SELECTED_MARKET
     
+    # Check if account exists before creating session
+    wallet_address = _get_credential("EOA_WALLET_ADDRESS")
+    if wallet_address:
+        account_exists = check_account_exists(wallet_address)
+        if account_exists is False:
+            print("\n✗ Account not found")
+            print("="*60)
+            print("You need to complete your account creation on Almanac first.")
+            print("Please visit https://almanac.market to create your account,")
+            print("then try trading again.")
+            print("="*60)
+            return
+        elif account_exists is None:
+            # Error checking account, but proceed anyway
+            pass
+    
     # Auto-create session if none exists
     if not CURRENT_SESSION:
         print("\nNo active trading session detected. Creating one now...")
@@ -1158,12 +1174,12 @@ def unlink_bittensor_hotkey(session_id: str, wallet_address: str):
         import traceback
         traceback.print_exc()
 
-def check_account_bittensor_status(wallet_address: str):
+def check_account_exists(wallet_address: str) -> bool:
     """
-    Check if an account already has a linked Bittensor hotkey.
+    Check if an account exists for the given wallet address.
     
     Returns:
-        dict with 'has_link' (bool), 'hotkey' (str or None), 'uid' (int or None)
+        True if account exists, False if 404 (account doesn't exist), None if other error
     """
     try:
         response = requests.get(
@@ -1173,6 +1189,34 @@ def check_account_bittensor_status(wallet_address: str):
             },
             timeout=30
         )
+        
+        if response.status_code == 404:
+            return False  # Account doesn't exist
+        elif response.status_code == 200:
+            return True  # Account exists
+        else:
+            return None  # Other error
+    except Exception:
+        return None  # Error occurred
+
+def check_account_bittensor_status(wallet_address: str):
+    """
+    Check if an account already has a linked Bittensor hotkey.
+    
+    Returns:
+        dict with 'has_link' (bool), 'hotkey' (str or None), 'uid' (int or None), 'error' (str or None)
+    """
+    try:
+        response = requests.get(
+            f"{ALMANAC_API_URL}/accounts/{wallet_address}",
+            headers={
+                "Content-Type": "application/json"
+            },
+            timeout=30
+        )
+        
+        if response.status_code == 404:
+            return {"has_link": False, "hotkey": None, "uid": None, "error": "account_not_found"}
         
         if response.status_code != 200:
             return {"has_link": False, "hotkey": None, "uid": None, "error": "Account lookup failed"}
@@ -1235,6 +1279,15 @@ def link_bittensor_uid():
     # Step 2: Check existing Bittensor link status
     print("\nStep 2: Checking existing Bittensor link status...")
     status = check_account_bittensor_status(wallet_address)
+    
+    if status.get("error") == "account_not_found":
+        print("\n✗ Account not found")
+        print("="*60)
+        print("You need to complete your account creation on Almanac first.")
+        print("Please visit https://almanac.market to create your account,")
+        print("then try linking your Bittensor UID again.")
+        print("="*60)
+        return
     
     if status.get("error"):
         print(f"⚠ Warning: Could not check account status: {status['error']}")
