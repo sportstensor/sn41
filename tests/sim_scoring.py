@@ -480,7 +480,13 @@ def main():
     print("Loading mock trading data...")
     
     # Load the mock data
-    trading_history = load_mock_data('tests/advanced_mock_data.json')
+    # If the trading_history.json file exists, load it from there
+    if os.path.exists('trading_history.json'):
+        with open('trading_history.json', 'r') as f:
+            trading_history = json.load(f)
+    else:
+        trading_history = load_mock_data('tests/advanced_mock_data.json')
+        
     print(f"Loaded {len(trading_history)} trades")
     
     # Extract miner information
