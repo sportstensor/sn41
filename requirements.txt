@@ -9,3 +9,11 @@ requests
 
 cvxpy
 ecos
+
+# Dependencies for api_trading.py (Almanac API Trading Client)
+python-dotenv>=1.0.0
+py-clob-client>=1.0.0
+eth-account>=0.8.0
+mnemonic>=0.20
+bip-utils>=2.9.0
+hdwallet>=2.2.0

@@ -2,7 +2,7 @@ __pycache__/
 venv/
 
 api_trading.env
+api_trading.env.example
 storage.env
 validator_state_*.json
-
 sims/
