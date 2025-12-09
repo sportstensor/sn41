@@ -49,6 +49,7 @@ from eth_account.messages import encode_typed_data as EIP712_ENCODE  # type: ign
 import time
 import secrets
 import bittensor as bt
+from datetime import datetime
 from constants import VOLUME_FEE
 
 # Configure logging
@@ -497,6 +498,78 @@ def _format_price(value):
     except Exception:
         return "-"
 
+def _format_game_start_time(game_start_time):
+    """
+    Format game start time to display like "Dec 5, 2025 7p EST"
+    
+    Args:
+        game_start_time: ISO format datetime string or timestamp
+        
+    Returns:
+        Formatted string like "Dec 5, 2025 7p EST" or None if parsing fails
+    """
+    if not game_start_time:
+        return None
+    
+    try:
+        # Try parsing as ISO format string
+        if isinstance(game_start_time, str):
+            # Handle ISO format with or without timezone
+            if 'T' in game_start_time:
+                dt = datetime.fromisoformat(game_start_time.replace('Z', '+00:00'))
+            else:
+                # Try timestamp
+                dt = datetime.fromtimestamp(int(game_start_time))
+        elif isinstance(game_start_time, (int, float)):
+            # Assume timestamp
+            dt = datetime.fromtimestamp(game_start_time)
+        else:
+            return None
+        
+        # Format: "Dec 5, 2025 7p EST"
+        # Get month abbreviation, day, year
+        month_abbr = dt.strftime("%b")
+        day = dt.day
+        year = dt.year
+        
+        # Format hour (12-hour format, no leading zero)
+        hour = dt.hour
+        if hour == 0:
+            hour_str = "12"
+            period = "a"
+        elif hour < 12:
+            hour_str = str(hour)
+            period = "a"
+        elif hour == 12:
+            hour_str = "12"
+            period = "p"
+        else:
+            hour_str = str(hour - 12)
+            period = "p"
+        
+        # Get timezone abbreviation (try to get EST/EDT, etc.)
+        # For simplicity, we'll use the timezone offset or default to EST
+        tz_str = "EST"  # Default
+        try:
+            if dt.tzinfo:
+                offset = dt.utcoffset().total_seconds() / 3600
+                if offset == -5:
+                    tz_str = "EST"
+                elif offset == -4:
+                    tz_str = "EDT"
+                elif offset == -8:
+                    tz_str = "PST"
+                elif offset == -7:
+                    tz_str = "PDT"
+                else:
+                    tz_str = dt.strftime("%Z") or "EST"
+        except Exception:
+            pass
+        
+        return f"{month_abbr} {day}, {year} {hour_str}{period} {tz_str}"
+    except Exception:
+        return None
+
 def _extract_outcomes_summary(market: dict) -> str:
     """
     Try to extract a concise outcomes summary like:
@@ -558,7 +631,7 @@ def _display_markets_for_event(event: dict) -> list:
     if not isinstance(markets, list) or not markets:
         print("No markets found for this event.")
         return []
-    # Order by first outcome price (index-0, commonly 'Yes') descending
+    # Order by first outcome price (index-0, commonly 'Yes') ascending (lowest first)
     def _first_yes_price(m):
         prices = m.get("outcome_prices") or []
         try:
@@ -571,7 +644,7 @@ def _display_markets_for_event(event: dict) -> list:
             return float(m.get("yesPrice") or 0.0)
         except Exception:
             return 0.0
-    markets = sorted(markets, key=_first_yes_price, reverse=True)
+    markets = sorted(markets, key=_first_yes_price, reverse=False)
     print("\nMarkets:")
     for idx, m in enumerate(markets, start=1):
         title = m.get("title") or m.get("question") or m.get("name") or "Untitled"
@@ -583,14 +656,189 @@ def _display_markets_for_event(event: dict) -> list:
             print(f"  {idx}) {title} [{market_id}]")
     return markets
 
+def fetch_clob_prices(token_ids: list) -> dict | None:
+    """
+    Fetch latest prices from the CLOB API for given token IDs.
+    
+    Args:
+        token_ids: List of token ID strings
+        
+    Returns:
+        Dictionary mapping token IDs to price data:
+        {
+            "token_id_1": {"BUY": "0.45", "SELL": "0.44"},
+            "token_id_2": {"BUY": "0.52", "SELL": "0.51"}
+        }
+        Returns None if the request fails.
+    """
+    if not token_ids:
+        return None
+    
+    try:
+        # Build BookParams array with both BUY and SELL side for each token
+        book_params = []
+        for token_id in token_ids:
+            book_params.append({"token_id": token_id, "side": "BUY"})
+            book_params.append({"token_id": token_id, "side": "SELL"})
+        
+        # Make POST request to CLOB API
+        response = requests.post(
+            f"{POLYMARKET_CLOB_HOST}/prices",
+            json=book_params,
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            print(f"Warning: Failed to fetch CLOB prices (status {response.status_code})")
+            return None
+        
+        prices_data = response.json()
+        return prices_data
+    except Exception as exc:
+        print(f"Warning: Error fetching CLOB prices: {exc}")
+        return None
+
+def _update_all_markets_prices_from_clob(markets: list) -> list:
+    """
+    Batch fetch latest prices from CLOB API for all markets and update their outcome_prices.
+    Stores original prices in _original_outcome_prices for fallback.
+    
+    Args:
+        markets: List of market dictionaries with clob_token_ids
+        
+    Returns:
+        List of updated market dictionaries with fresh outcome_prices
+    """
+    if not isinstance(markets, list) or not markets:
+        return markets
+    
+    # Collect all token IDs from all markets
+    all_token_ids = []
+    market_token_map = {}  # Map token_id -> list of (market_idx, outcome_idx) tuples
+    
+    for market_idx, market in enumerate(markets):
+        clob_token_ids = market.get("clob_token_ids")
+        if isinstance(clob_token_ids, list) and clob_token_ids:
+            # Store original prices for fallback
+            original_prices = market.get("outcome_prices")
+            if original_prices:
+                market["_original_outcome_prices"] = original_prices.copy() if isinstance(original_prices, list) else original_prices
+            
+            # Track which market/outcome each token belongs to
+            for outcome_idx, token_id in enumerate(clob_token_ids):
+                token_id_str = str(token_id)
+                if token_id_str not in market_token_map:
+                    market_token_map[token_id_str] = []
+                    all_token_ids.append(token_id)
+                market_token_map[token_id_str].append((market_idx, outcome_idx))
+    
+    # If no token IDs found, return markets unchanged
+    if not all_token_ids:
+        return markets
+    
+    # Batch fetch all prices from CLOB API
+    prices_data = fetch_clob_prices(all_token_ids)
+    if not prices_data:
+        return markets
+    
+    # Update all markets with fetched prices
+    for market_idx, market in enumerate(markets):
+        clob_token_ids = market.get("clob_token_ids")
+        if not isinstance(clob_token_ids, list) or not clob_token_ids:
+            continue
+        
+        updated_prices = []
+        for token_id in clob_token_ids:
+            # Try multiple formats for token ID lookup
+            token_prices = None
+            token_id_str = str(token_id)
+            if token_id_str in prices_data:
+                token_prices = prices_data[token_id_str]
+            else:
+                try:
+                    token_id_num = int(token_id)
+                    if str(token_id_num) in prices_data:
+                        token_prices = prices_data[str(token_id_num)]
+                except (ValueError, TypeError):
+                    pass
+            
+            if token_prices:
+                # Use mid price (average of BUY and SELL) or BUY price as fallback
+                buy_price = token_prices.get("BUY")
+                sell_price = token_prices.get("SELL")
+                if buy_price and sell_price:
+                    try:
+                        buy_float = float(buy_price)
+                        sell_float = float(sell_price)
+                        mid_price = (buy_float + sell_float) / 2.0
+                        updated_prices.append(mid_price)
+                    except (ValueError, TypeError):
+                        try:
+                            updated_prices.append(float(buy_price))
+                        except (ValueError, TypeError):
+                            updated_prices.append(None)
+                elif buy_price:
+                    try:
+                        updated_prices.append(float(buy_price))
+                    except (ValueError, TypeError):
+                        updated_prices.append(None)
+                else:
+                    updated_prices.append(None)
+            else:
+                updated_prices.append(None)
+        
+        # Update market with fresh prices (only if we got valid prices)
+        if updated_prices and any(p is not None for p in updated_prices):
+            market["outcome_prices"] = updated_prices
+            # Store raw CLOB price data for this market's tokens
+            market_clob_prices = {}
+            for token_id in clob_token_ids:
+                token_id_str = str(token_id)
+                if token_id_str in prices_data:
+                    market_clob_prices[token_id_str] = prices_data[token_id_str]
+                else:
+                    try:
+                        token_id_num = int(token_id)
+                        if str(token_id_num) in prices_data:
+                            market_clob_prices[str(token_id_num)] = prices_data[str(token_id_num)]
+                    except (ValueError, TypeError):
+                        pass
+            if market_clob_prices:
+                market["_clob_prices"] = market_clob_prices
+    
+    return markets
+
+def _update_market_prices_from_clob(market: dict) -> dict:
+    """
+    Fetch latest prices from CLOB API and update the market's outcome_prices.
+    Stores original prices in _original_outcome_prices for comparison.
+    This is a single-market version - use _update_all_markets_prices_from_clob for batch updates.
+    
+    Args:
+        market: Market dictionary with clob_token_ids
+        
+    Returns:
+        Updated market dictionary with fresh outcome_prices
+    """
+    # Use the batch function for single market
+    updated_markets = _update_all_markets_prices_from_clob([market])
+    return updated_markets[0] if updated_markets else market
+
 def _display_outcomes_and_choose(market: dict):
     """
     Show detailed outcomes for a market (if available) and let the user pick one.
+    Uses CLOB prices if available, falls back to original prices if CLOB fetch failed.
     Returns a tuple (chosen_outcome_name, chosen_outcome_price, chosen_token_id).
     """
     outcomes = market.get("outcomes")
-    outcome_prices = market.get("outcome_prices")
+    outcome_prices = market.get("outcome_prices")  # These should be CLOB prices if fetched successfully
+    original_prices = market.get("_original_outcome_prices")  # Original prices from API (fallback)
     clob_token_ids = market.get("clob_token_ids")
+    clob_prices = market.get("_clob_prices")  # Raw CLOB price data
+
+    # Check if CLOB fetch was successful
+    clob_fetch_successful = clob_prices is not None
 
     # Normalize into list of dicts {name, price?, tokenId?} with index alignment
     normalized = []
@@ -599,10 +847,19 @@ def _display_outcomes_and_choose(market: dict):
             name = o if isinstance(o, str) else (o.get("name") if isinstance(o, dict) else str(o))
             price = None
             token_id = None
-            if isinstance(outcome_prices, list) and idx < len(outcome_prices):
+            
+            # Get current price (prefer CLOB prices if fetch was successful)
+            if clob_fetch_successful and isinstance(outcome_prices, list) and idx < len(outcome_prices):
                 price = outcome_prices[idx]
+            
+            # Fallback to original prices if CLOB fetch failed
+            if price is None and isinstance(original_prices, list) and idx < len(original_prices):
+                price = original_prices[idx]
+            
             if isinstance(clob_token_ids, list) and idx < len(clob_token_ids):
                 token_id = clob_token_ids[idx]
+            
+            # Fallback to other price sources if still no price
             if price is None and isinstance(o, dict):
                 price = (
                     o.get("price")
@@ -611,21 +868,44 @@ def _display_outcomes_and_choose(market: dict):
                     or o.get("probability")
                     or o.get("p")
                 )
+            
             normalized.append({"name": name or "?", "price": price, "tokenId": token_id})
     elif isinstance(outcomes, dict):
         # If dict, best-effort alignment by iteration order
         for idx, (name, maybe_price) in enumerate(outcomes.items()):
             price = maybe_price
             token_id = None
-            if isinstance(outcome_prices, list) and idx < len(outcome_prices):
+            
+            # Get current price (prefer CLOB prices if fetch was successful)
+            if clob_fetch_successful and isinstance(outcome_prices, list) and idx < len(outcome_prices):
                 price = outcome_prices[idx]
+            
+            # Fallback to original prices if CLOB fetch failed
+            if price is None and isinstance(original_prices, list) and idx < len(original_prices):
+                price = original_prices[idx]
+            
             if isinstance(clob_token_ids, list) and idx < len(clob_token_ids):
                 token_id = clob_token_ids[idx]
+            
+            # If we still don't have a price, use maybe_price from dict
+            if price is None:
+                price = maybe_price
+            
             normalized.append({"name": str(name), "price": price, "tokenId": token_id})
     else:
         # Fallback binary representation
         yes_price = market.get("yesPrice") or market.get("yes")
         no_price = market.get("noPrice") or market.get("no")
+        
+        # Use CLOB prices if fetch was successful
+        if clob_fetch_successful and isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
+            yes_price = outcome_prices[0]
+            no_price = outcome_prices[1]
+        # Fallback to original prices if CLOB fetch failed
+        elif isinstance(original_prices, list) and len(original_prices) >= 2:
+            yes_price = original_prices[0]
+            no_price = original_prices[1]
+        
         if yes_price is not None or no_price is not None:
             normalized = [
                 {"name": "Yes", "price": yes_price, "tokenId": None},
@@ -638,7 +918,8 @@ def _display_outcomes_and_choose(market: dict):
 
     print("\nOutcomes:")
     for idx, o in enumerate(normalized, start=1):
-        print(f"  {idx}) {o['name']} {_format_price(o.get('price'))}")
+        price_str = _format_price(o.get('price'))
+        print(f"  {idx}) {o['name']} {price_str}")
     sel = input("\nSelect outcome to trade (or Enter to cancel): ").strip()
     if not sel:
         return None  # Signal cancellation
@@ -1255,6 +1536,30 @@ def search_markets():
         for idx, ev in enumerate(events, start=1):
             ev_title = ev.get("title") or ev.get("question") or ev.get("name") or "Untitled Event"
             ev_id = ev.get("id") or ev.get("eventId") or ev.get("_id") or "unknown"
+            
+            # Check if event has "Games" tag (tags are list of dicts with 'label' field)
+            tags = ev.get("tags", [])
+            has_games_tag = False
+            if isinstance(tags, list):
+                has_games_tag = any(
+                    isinstance(tag, dict) and tag.get("label") == "Games"
+                    for tag in tags
+                )
+            
+            # Check markets for game_start_time (it's on markets, not events)
+            game_start_time = None
+            markets = ev.get("markets", [])
+            if isinstance(markets, list) and len(markets) > 0:
+                # Get game_start_time from first market (they should all have the same time)
+                first_market = markets[0]
+                game_start_time = first_market.get("game_start_time")
+            
+            # Format event title with game start time if available
+            if has_games_tag and game_start_time:
+                formatted_time = _format_game_start_time(game_start_time)
+                if formatted_time:
+                    ev_title = f"{ev_title} -- {formatted_time}"
+            
             print(f"  {idx}) {ev_title} [{ev_id}]")
         sel = input("\nChoose an event by number (or Enter to cancel): ").strip()
         if not sel:
@@ -1269,7 +1574,68 @@ def search_markets():
             print("Selection out of range.")
             return
         chosen_event = events[sel_idx - 1]
-        markets = _display_markets_for_event(chosen_event)
+        
+        # Fetch full event details from API to get child events and complete market data
+        event_id = chosen_event.get("id") or chosen_event.get("eventId") or chosen_event.get("_id")
+        if event_id:
+            try:
+                event_resp = requests.get(f"{ALMANAC_API_URL}/markets/events/{event_id}", timeout=30)
+                if event_resp.status_code == 200:
+                    event_data = event_resp.json()
+                    # Use the full event data (may include child events and more complete market data)
+                    if isinstance(event_data, dict):
+                        # Handle response wrapped in 'data' or direct event object
+                        full_event = event_data.get("data") or event_data
+                        chosen_event = full_event
+                    else:
+                        print("⚠ Unexpected event data format")
+                else:
+                    print(f"⚠ Could not fetch full event details (status {event_resp.status_code}), using search result data")
+            except Exception as exc:
+                print(f"⚠ Could not fetch full event details: {exc}, using search result data")
+        
+        # Get markets from event before displaying
+        markets = chosen_event.get("markets") or []
+        
+        # Check for child events and include their markets
+        child_events = chosen_event.get("childEvents") or chosen_event.get("child_events") or chosen_event.get("children")
+        if child_events and isinstance(child_events, list):
+            for child_event in child_events:
+                child_markets = child_event.get("markets") or []
+                if child_markets:
+                    markets = markets + child_markets
+        
+        # Check for parent event and include its markets
+        parent_event_id = chosen_event.get("parentEventId") or chosen_event.get("parent_event_id")        
+        if parent_event_id:
+            try:
+                parent_resp = requests.get(f"{ALMANAC_API_URL}/events/{parent_event_id}", timeout=30)
+                if parent_resp.status_code == 200:
+                    parent_event_data = parent_resp.json()
+                    # Handle response wrapped in 'data' or direct event object
+                    parent_event = parent_event_data.get("data") or parent_event_data
+                    parent_markets = parent_event.get("markets") or []
+                    if parent_markets:
+                        markets = markets + parent_markets
+                        print(f"\nNote: Found {len(parent_markets)} additional markets from parent event")
+            except Exception as exc:
+                print(f"Warning: Could not fetch parent event: {exc}")
+        
+        if not isinstance(markets, list) or not markets:
+            print("No markets found for this event.")
+            return
+        
+        # Batch fetch latest prices from CLOB API for all markets in the event
+        print("\nFetching latest prices from CLOB API for all markets...")
+        markets = _update_all_markets_prices_from_clob(markets)
+        clob_fetch_successful = any(m.get("_clob_prices") for m in markets)
+        if clob_fetch_successful:
+            print("✓ Latest prices fetched successfully")
+        else:
+            print("⚠ Could not fetch latest prices (using cached prices)")
+        
+        # Now display the markets with updated prices
+        markets = _display_markets_for_event({"markets": markets})
         if not markets:
             return
         
@@ -1296,6 +1662,9 @@ def search_markets():
             title = SELECTED_MARKET.get("title") or SELECTED_MARKET.get("question") or SELECTED_MARKET.get("name") or "Untitled"
             market_id = SELECTED_MARKET.get("id") or SELECTED_MARKET.get("marketId") or SELECTED_MARKET.get("_id") or "unknown"
             print(f"\nSelected market: {title} [{market_id}]")
+
+        # Prices have already been fetched for all markets when the event was selected
+        # No need to fetch again here - the selected market already has updated prices
 
         result = _display_outcomes_and_choose(SELECTED_MARKET)
         if result is None:

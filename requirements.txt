@@ -17,3 +17,5 @@ eth-account>=0.8.0
 mnemonic>=0.20
 bip-utils>=2.9.0
 hdwallet>=2.2.0
+py_clob_client
+dotenv
