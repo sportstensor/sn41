@@ -251,7 +251,6 @@ def _detect_credential_sets():
         
     except Exception as exc:
         logger.error(f"Error detecting credential sets: {exc}", exc_info=True)
-        print(f"Warning: Could not detect credential sets: {exc}")
     
     logger.info(f"Detected {len(credential_sets)} credential set(s): {list(credential_sets.keys())}")
     return credential_sets
@@ -326,10 +325,9 @@ def _get_private_key() -> str | None:
         # Check if mnemonic support libraries are available
         if not MNEMONIC_SUPPORT:
             logger.error("Mnemonic support libraries not installed")
-            print("Warning: mnemonic support libraries not installed.")
-            print("Please install: pip install mnemonic bip-utils")
-            print("Or alternatively: pip install mnemonic hdwallet")
-            print("Or use EOA_WALLET_PK instead of EOA_WALLET_MNEMONIC")
+            logger.warning("Please install: pip install mnemonic bip-utils")
+            logger.warning("Or alternatively: pip install mnemonic hdwallet")
+            logger.warning("Or use EOA_WALLET_PK instead of EOA_WALLET_MNEMONIC")
             return None
         
         try:
@@ -338,7 +336,6 @@ def _get_private_key() -> str | None:
             mnemo = Mnemonic("english")
             if not mnemo.check(mnemonic_phrase):
                 logger.error("Invalid mnemonic phrase (checksum or format error)")
-                print("Error: Invalid mnemonic phrase")
                 return None
             logger.info("✓ Mnemonic phrase validated successfully")
             
@@ -374,7 +371,6 @@ def _get_private_key() -> str | None:
                     return private_key
                 except Exception as exc:
                     logger.warning(f"bip_utils derivation failed: {exc}, trying hdwallet fallback...")
-                    print(f"Warning: bip_utils derivation failed: {exc}")
                     # Fall through to hdwallet method
             
             # Method 2: Fallback to hdwallet library
@@ -407,19 +403,15 @@ def _get_private_key() -> str | None:
             
             # If neither library works, provide helpful error
             logger.error("No mnemonic derivation library available")
-            print("Error: No mnemonic derivation library available.")
-            print("Please install one of:")
-            print("  pip install bip-utils  (recommended)")
-            print("  pip install hdwallet")
+            logger.error("Please install one of:")
+            logger.error("  pip install bip-utils  (recommended)")
+            logger.error("  pip install hdwallet")
             return None
             
         except Exception as exc:
             logger.error(f"Error deriving private key from mnemonic: {exc}", exc_info=True)
-            print(f"Error deriving private key from mnemonic: {exc}")
-            print("Make sure you have installed: pip install mnemonic bip-utils")
-            print("Or alternatively: pip install mnemonic hdwallet")
-            import traceback
-            traceback.print_exc()
+            logger.error("Make sure you have installed: pip install mnemonic bip-utils")
+            logger.error("Or alternatively: pip install mnemonic hdwallet")
             return None
     
     # No private key or mnemonic found
@@ -941,11 +933,11 @@ def _place_order_now(market: dict, chosen_outcome_name: str | None = None, chose
     """
     global CURRENT_SESSION
     if not CURRENT_SESSION:
-        print("No active trading session. Create a session first in the Trading Menu.")
+        logger.error("No active trading session. Create a session first in the Trading Menu.")
         return
     market_id = market.get("id") or market.get("marketId") or market.get("_id")
     if not market_id:
-        print("Selected market missing id.")
+        logger.error("Selected market missing id.")
         return
     
     market_title = market.get("title") or market.get("question") or market.get("name") or "Unknown Market"
@@ -1064,12 +1056,12 @@ def start_trading_flow():
     if wallet_address:
         account_exists = check_account_exists(wallet_address)
         if account_exists is False:
-            print("\n✗ Account not found")
-            print("="*60)
-            print("You need to complete your account creation on Almanac first.")
-            print("Please visit https://almanac.market to create your account,")
-            print("then try trading again.")
-            print("="*60)
+            logger.error("✗ Account not found")
+            logger.error("="*60)
+            logger.error("You need to complete your account creation on Almanac first.")
+            logger.error("Please visit https://almanac.market to create your account,")
+            logger.error("then try trading again.")
+            logger.error("="*60)
             return
         elif account_exists is None:
             # Error checking account, but proceed anyway
@@ -1078,31 +1070,27 @@ def start_trading_flow():
     # Auto-create session if none exists
     if not CURRENT_SESSION:
         logger.info("No active trading session detected, creating new session...")
-        print("\nNo active trading session detected. Creating one now...")
         try:
             session = initiate_trading_session()
             if session:
                 logger.info("✓ Trading session created successfully")
-                print("Trading session created successfully.")
                 CURRENT_SESSION = session
                 # Log session details (without sensitive data)
                 if session.get('data', {}).get('sessionId'):
                     logger.debug(f"Session ID: {session['data']['sessionId']}")
                     logger.debug(f"Proxy wallet: {session['data'].get('proxyWallet', 'N/A')}")
             else:
-                logger.error("Failed to create trading session")
-                print("Failed to create trading session. Please check your configuration.")
+                logger.error("Failed to create trading session. Please check your configuration.")
                 return
         except Exception as exc:
             logger.error(f"Exception creating trading session: {exc}", exc_info=True)
-            print(f"Failed to create trading session: {exc}")
             return
     
     while True:
-        print("\nTrading Menu:")
-        print("  1) Search and Trade Markets")
-        print("  2) Refresh Trading Session")
-        print("  3) Back to Main Menu")
+        logger.info("\nTrading Menu:")
+        logger.info("  1) Search and Trade Markets")
+        logger.info("  2) Refresh Trading Session")
+        logger.info("  3) Back to Main Menu")
         choice = input("\nEnter choice: ").strip()
 
         if choice == "1":
@@ -1111,16 +1099,16 @@ def start_trading_flow():
             try:
                 session = initiate_trading_session()
                 if session:
-                    print("\nTrading session refreshed.")
+                    logger.info("Trading session refreshed.")
                     CURRENT_SESSION = session
                 else:
-                    print("Trading session could not be refreshed.")
+                    logger.error("Trading session could not be refreshed.")
             except Exception as exc:
-                print(f"Failed to refresh trading session: {exc}")
+                logger.error(f"Failed to refresh trading session: {exc}")
         elif choice == "3":
             break
         else:
-            print("Invalid choice. Please enter a number from 1 to 3.\n")
+            logger.warning("Invalid choice. Please enter a number from 1 to 3.")
 
 def initiate_trading_session():
     """
@@ -1164,8 +1152,7 @@ def initiate_trading_session():
     logger.debug("Loading wallet credentials...")
     wallet_address = _get_credential("EOA_WALLET_ADDRESS")
     if not wallet_address:
-        logger.error(f"EOA_WALLET_ADDRESS not found in {ENV_PATH}")
-        print(f"EOA_WALLET_ADDRESS not found in {ENV_PATH}. Please set it and try again.")
+        logger.error(f"EOA_WALLET_ADDRESS not found in {ENV_PATH}. Please set it and try again.")
         return
     
     logger.debug(f"Wallet address: {wallet_address}")
@@ -1182,12 +1169,10 @@ def initiate_trading_session():
         addr = Account.from_key(private_key).address.lower()
         if addr != wallet_address.lower():
             logger.error(f"Private key mismatch: derived {addr} != configured {wallet_address}")
-            print(f"Private key does not match wallet address: {addr} != {wallet_address}")
             return
         logger.info("✓ Private key matches wallet address")
     except Exception as exc:
         logger.error(f"Invalid private key: {exc}")
-        print(f"Invalid private key: {exc}")
         return
 
     # Step 3: Prepare EIP-191 message signature (personal_sign standard)
@@ -1230,14 +1215,11 @@ def initiate_trading_session():
     
     if response.status_code != 200:
         logger.error(f"Failed to create trading session: HTTP {response.status_code}")
-        print(f"Failed to create trading session:")
         try:
             error_data = response.json()
-            print(json.dumps(error_data, indent=2))
-            logger.debug(f"Error response: {json.dumps(error_data)}")
+            logger.error(f"Error response: {json.dumps(error_data)}")
         except Exception:
-            print(response.text)
-            logger.debug(f"Error response (text): {response.text}")
+            logger.error(f"Error response (text): {response.text}")
         return None
     
     logger.info("✓ Trading session created successfully")
@@ -1278,7 +1260,7 @@ def place_order(
     """
     global CURRENT_SESSION
     if not CURRENT_SESSION:
-        print("No active trading session. Create a session first.")
+        logger.error("No active trading session. Create a session first.")
         return
 
     session_id = (
@@ -1456,8 +1438,7 @@ def place_order(
         traceback.print_exc()
 
     if signed_flow_payload is None:
-        logger.error("Failed to build signed order payload, aborting")
-        print("Failed to build signed order payload. Aborting without sending.")
+        logger.error("Failed to build signed order payload. Aborting without sending.")
         return
     payload = signed_flow_payload
 
@@ -1473,23 +1454,17 @@ def place_order(
         )
         if resp.status_code != 200:
             logger.error(f"Order submission failed: HTTP {resp.status_code}")
-            print("Failed to place order:")
             try:
                 error_data = resp.json()
-                print(json.dumps(error_data, indent=2))
-                logger.debug(f"Error response: {json.dumps(error_data)}")
+                logger.error(f"Error response: {json.dumps(error_data)}")
             except Exception:
-                print(resp.text)
-                logger.debug(f"Error response (text): {resp.text}")
+                logger.error(f"Error response (text): {resp.text}")
             return
         logger.info("✓ Order placed successfully")
-        print("Order placed:")
         result = resp.json()
-        print(json.dumps(result, indent=2))
-        logger.debug(f"Order response: {json.dumps(result)}")
+        logger.info(f"Order response: {json.dumps(result, indent=2)}")
     except Exception as exc:
         logger.error(f"Exception placing order: {exc}", exc_info=True)
-        print(f"Order error: {exc}")
 
 def search_markets():
     """
@@ -1714,22 +1689,22 @@ def initiate_wallet_session():
     # Load wallet address and private key
     wallet_address = _get_credential("EOA_WALLET_ADDRESS")
     if not wallet_address:
-        print(f"EOA_WALLET_ADDRESS not found in {ENV_PATH}. Please set it and try again.")
+        logger.error(f"EOA_WALLET_ADDRESS not found in {ENV_PATH}. Please set it and try again.")
         return None
     
     private_key = _get_private_key()
     if not private_key:
-        print(f"EOA_WALLET_PK or EOA_WALLET_MNEMONIC not found in {ENV_PATH}. Please set one of them and try again.")
+        logger.error(f"EOA_WALLET_PK or EOA_WALLET_MNEMONIC not found in {ENV_PATH}. Please set one of them and try again.")
         return None
     
     # Validate address derives cleanly (optional)
     try:
         addr = Account.from_key(private_key).address.lower()
         if addr != wallet_address.lower():
-            print(f"Private key does not match wallet address: {addr} != {wallet_address}")
+            logger.error(f"Private key does not match wallet address: {addr} != {wallet_address}")
             return None
     except Exception as exc:
-        print(f"Invalid private key: {exc}")
+        logger.error(f"Invalid private key: {exc}")
         return None
 
     # Prepare EIP-191 message (personal_sign)
@@ -1753,11 +1728,11 @@ def initiate_wallet_session():
         }
     )
     if response.status_code != 200:
-        print(f"Failed to create wallet session:")
+        logger.error("Failed to create wallet session")
         try:
-            print(json.dumps(response.json(), indent=2))
+            logger.error(f"Error response: {json.dumps(response.json(), indent=2)}")
         except Exception:
-            print(response.text)
+            logger.error(f"Error response (text): {response.text}")
         return None
     return response.json()
 
@@ -2076,7 +2051,6 @@ def generate_polymarket_credentials():
         print(f"Using wallet: {addr}")
     except Exception as exc:
         logger.error(f"Invalid private key: {exc}")
-        print(f"Invalid private key: {exc}")
         return
 
     # Step 3: Get proxy funder address (required for Polymarket)
