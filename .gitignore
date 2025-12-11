@@ -6,3 +6,4 @@ storage.env
 validator_state_*.json
 
 sims/
+.DS_Store

@@ -43,7 +43,7 @@ import time
 import secrets
 import bittensor as bt
 from datetime import datetime
-from constants import VOLUME_FEE
+from constants import VOLUME_FEE, PRICE_BUFFER_ADJUSTMENT
 
 ALMANAC_API_URL = "https://api.almanac.market/api"
 #ALMANAC_API_URL = "http://localhost:3001/api"
@@ -803,12 +803,22 @@ def _place_order_now(market: dict, chosen_outcome_name: str | None = None, chose
         order_type = "FOK"
     
     side_upper = "BUY" if side == "buy" else "SELL"
-    notional = size * price
-    # Fee calculation is for display only - we send original size/price to API
+    
+    # Apply the same price adjustment logic that place_order() uses
+    # This ensures the order summary shows the actual values that will be sent to the API
+    if side_upper == "BUY":
+        adjusted_price = price + PRICE_BUFFER_ADJUSTMENT
+        price_note = f"(+${PRICE_BUFFER_ADJUSTMENT} buffer for {side_upper} orders)"
+    else:  # SELL
+        adjusted_price = max(0.01, price - PRICE_BUFFER_ADJUSTMENT)
+        price_note = f"(-${PRICE_BUFFER_ADJUSTMENT} buffer for {side_upper} orders)"
+    
+    # Calculate with adjusted price (what will actually be sent to API)
+    notional = size * adjusted_price
     fee = notional * VOLUME_FEE
     total_with_fee = notional + fee
     
-    # Display summary
+    # Display summary with actual values
     print("\n" + "="*60)
     print("Order Summary:")
     print("="*60)
@@ -819,7 +829,8 @@ def _place_order_now(market: dict, chosen_outcome_name: str | None = None, chose
     print(f"Side: {side_upper}")
     print(f"Order Type: {order_type}")
     print(f"Size: {size}")
-    print(f"Price: {price}")
+    print(f"Requested Price: {price}")
+    print(f"Adjusted Price: {adjusted_price} {price_note}")
     print(f"Subtotal: ${notional:.2f}")
     print(f"Platform Fee ({VOLUME_FEE*100:.1f}%): ${fee:.2f}")
     print(f"Total: ${total_with_fee:.2f}")
@@ -1072,13 +1083,13 @@ def place_order(
             # use BigInt(Date.now()) for salt
             salt = int(time.time() * 1000)
             
-            # Size is shares, apply ±0.01 price adjustment for leeway
+            # Size is shares, apply ±PRICE_BUFFER_ADJUSTMENT for leeway
             # This ensures effective price is slightly worse to prevent rejection due to rounding
             if side_num == 0:  # BUY
                 # For BUY: size is shares we want to receive
-                # Adjust price upward (+0.01) to ensure effective price >= orderbook price
-                # makerAmount: USDC we pay = shares * (price + 0.01)
-                adjusted_price = price + 0.01
+                # Adjust price upward to ensure effective price >= orderbook price
+                # makerAmount: USDC we pay = shares * (price + PRICE_BUFFER_ADJUSTMENT)
+                adjusted_price = price + PRICE_BUFFER_ADJUSTMENT
                 usdc_amount = round_to_decimals(size * adjusted_price, 2)
                 maker_amount = int(round(usdc_amount * 1_000_000))
                 
@@ -1086,12 +1097,12 @@ def place_order(
                 taker_amount = to_6d_int(size)
             else:  # SELL
                 # For SELL: size is shares we want to sell
-                # Adjust price downward (-0.01) to ensure effective price <= orderbook price
+                # Adjust price downward to ensure effective price <= orderbook price
                 # makerAmount: shares we sell
                 maker_amount = to_6d_int(size)
                 
-                # takerAmount: USDC we receive = shares * (price - 0.01)
-                adjusted_price = max(0.01, price - 0.01)  # Ensure price doesn't go negative
+                # takerAmount: USDC we receive = shares * (price - PRICE_BUFFER_ADJUSTMENT)
+                adjusted_price = max(0.01, price - PRICE_BUFFER_ADJUSTMENT)  # Ensure price doesn't go negative
                 usdc_amount = round_to_decimals(size * adjusted_price, 2)
                 taker_amount = int(round(usdc_amount * 1_000_000))
 

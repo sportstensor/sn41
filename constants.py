@@ -3,6 +3,10 @@ ROLLING_HISTORY_IN_DAYS = 30
 
 # Constants for the scoring function
 VOLUME_FEE = 0.01
+
+# Price adjustment buffer for order placement
+PRICE_BUFFER_ADJUSTMENT = 0.01
+
 ROI_MIN = 0.0
 VOLUME_MIN = 1
 VOLUME_DECAY = 0.9
