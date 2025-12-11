@@ -11,13 +11,17 @@ It allows you to:
 
 Credential Sets:
 Supports multiple wallet accounts via prefixed environment variables (e.g., WALLET1_EOA_WALLET_ADDRESS).
-Each set can have its own wallet address, private key, proxy funder, and Polymarket API credentials.
+Each set can have its own wallet address, private key (or mnemonic), proxy funder, and Polymarket API credentials.
 Switch between sets at runtime - sessions are automatically cleared when switching accounts.
+
+Private Key vs Mnemonic:
+You can use either EOA_WALLET_PK (private key) or EOA_WALLET_MNEMONIC (12/24 word mnemonic phrase).
+If both are provided, EOA_WALLET_PK takes precedence. Mnemonic uses standard BIP44 derivation (m/44'/60'/0'/0/0).
 
 Requirements:
 - Python 3.10+
 - Almanac account (setup at https://almanac.market)
-- EOA wallet private key for signing transactions
+- EOA wallet private key OR mnemonic phrase for signing transactions
 - Optional: Polymarket API credentials (can be generated via this script)
 
 Python dependencies:
@@ -26,12 +30,15 @@ Python dependencies:
 - py-clob-client
 - eth-account
 - bittensor
+- mnemonic
+- bip-utils (recommended for mnemonic support) OR hdwallet
 
-pip install requests dotenv py-clob-client eth-account bittensor
+pip install requests dotenv py-clob-client eth-account bittensor mnemonic bip-utils
 """
 
 import os
 import json
+import logging
 from pathlib import Path
 import requests
 from dotenv import load_dotenv
@@ -44,6 +51,36 @@ import secrets
 import bittensor as bt
 from datetime import datetime
 from constants import VOLUME_FEE
+
+# Configure logging
+# Set up logging to show INFO level and above, with timestamps
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# Optional imports for mnemonic support
+try:
+    from mnemonic import Mnemonic
+    try:
+        from hdwallet import HDWallet
+        from hdwallet.cryptocurrencies import Ethereum
+        USE_HDWALLET = True
+    except ImportError:
+        USE_HDWALLET = False
+    # Also try bip_utils as alternative
+    try:
+        from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
+        USE_BIP_UTILS = True
+    except ImportError:
+        USE_BIP_UTILS = False
+    MNEMONIC_SUPPORT = True
+except ImportError:
+    MNEMONIC_SUPPORT = False
+    USE_HDWALLET = False
+    USE_BIP_UTILS = False
 
 ALMANAC_API_URL = "https://api.almanac.market/api"
 #ALMANAC_API_URL = "http://localhost:3001/api"
@@ -84,28 +121,42 @@ CREDENTIAL_SETS = {}  # Dictionary of available credential sets
 def _detect_credential_sets():
     """
     Scan the .env file for credential sets.
-    Supports both default (no prefix) and named sets (with prefix like WALLET1_, WALLET2_, etc.)
+    
+    Supports multiple credential sets via prefixes:
+    - Default set: EOA_WALLET_ADDRESS, EOA_WALLET_PK, etc. (no prefix)
+    - Named sets: WALLET1_EOA_WALLET_ADDRESS, WALLET1_EOA_WALLET_PK, etc.
+    
+    Each credential set must have:
+    - EOA_WALLET_ADDRESS (required)
+    - EOA_PROXY_FUNDER (required)
+    - EOA_WALLET_PK OR EOA_WALLET_MNEMONIC (at least one required)
     
     Returns:
         dict: Dictionary mapping credential set names to their credential dicts
+        Example: {"default": {...}, "WALLET1": {...}}
     """
+    logger.debug(f"Scanning for credential sets in {ENV_PATH}...")
     credential_sets = {}
     
     if not ENV_PATH.exists():
+        logger.warning(f"Environment file not found: {ENV_PATH}")
         return credential_sets
     
     # Load the .env file to get all variables
     load_dotenv(dotenv_path=str(ENV_PATH), override=True)
     
     # Required credential keys (must have values)
+    # Note: EOA_WALLET_PK or EOA_WALLET_MNEMONIC must be provided (at least one)
     required_keys = [
         "EOA_WALLET_ADDRESS",
-        "EOA_WALLET_PK",
         "EOA_PROXY_FUNDER"
     ]
     
     # Optional credential keys (must exist but can be empty)
+    # EOA_WALLET_PK and EOA_WALLET_MNEMONIC are mutually exclusive - at least one should be provided
     optional_keys = [
+        "EOA_WALLET_PK",
+        "EOA_WALLET_MNEMONIC",
         "POLYMARKET_API_KEY",
         "POLYMARKET_API_SECRET",
         "POLYMARKET_API_PASSPHRASE"
@@ -169,6 +220,15 @@ def _detect_credential_sets():
                     all_required_present = False
                     break
             
+            # Check that at least one of EOA_WALLET_PK or EOA_WALLET_MNEMONIC is present
+            pk_key = f"{prefix}_EOA_WALLET_PK" if prefix else "EOA_WALLET_PK"
+            mnemonic_key = f"{prefix}_EOA_WALLET_MNEMONIC" if prefix else "EOA_WALLET_MNEMONIC"
+            has_pk = bool(env_vars.get(pk_key, "").strip())
+            has_mnemonic = bool(env_vars.get(mnemonic_key, "").strip())
+            
+            if not (has_pk or has_mnemonic):
+                all_required_present = False
+            
             # Only proceed if all required keys are present with values
             if not all_required_present:
                 continue
@@ -187,16 +247,22 @@ def _detect_credential_sets():
             # Add the credential set
             set_name = prefix if prefix else "default"
             credential_sets[set_name] = creds
+            logger.debug(f"Found credential set: {set_name}")
         
     except Exception as exc:
-        print(f"Warning: Could not detect credential sets: {exc}")
+        logger.error(f"Error detecting credential sets: {exc}", exc_info=True)
     
+    logger.info(f"Detected {len(credential_sets)} credential set(s): {list(credential_sets.keys())}")
     return credential_sets
 
 def _get_credential(key: str) -> str | None:
     """
-    Get a credential value, checking the selected credential set first,
-    then falling back to default environment variables.
+    Get a credential value with fallback chain.
+    
+    Priority order:
+    1. Selected credential set (if one is selected)
+    2. Default credential set (if exists)
+    3. Environment variables (direct os.getenv)
     
     Args:
         key: The credential key (e.g., "EOA_WALLET_ADDRESS")
@@ -204,18 +270,153 @@ def _get_credential(key: str) -> str | None:
     Returns:
         The credential value or None if not found
     """
-    # If a credential set is selected, use it
+    # Priority 1: Check selected credential set first
     if SELECTED_CREDENTIAL_SET and SELECTED_CREDENTIAL_SET in CREDENTIAL_SETS:
         creds = CREDENTIAL_SETS[SELECTED_CREDENTIAL_SET]
         if key in creds:
+            logger.debug(f"Found {key} in selected credential set: {SELECTED_CREDENTIAL_SET}")
             return creds[key]
     
-    # Fallback to default credentials (no prefix)
+    # Priority 2: Fallback to default credentials (no prefix)
     if "default" in CREDENTIAL_SETS and key in CREDENTIAL_SETS["default"]:
+        logger.debug(f"Found {key} in default credential set")
         return CREDENTIAL_SETS["default"][key]
     
-    # Final fallback to environment variables
-    return os.getenv(key)
+    # Priority 3: Final fallback to environment variables
+    value = os.getenv(key)
+    if value:
+        logger.debug(f"Found {key} in environment variables")
+    else:
+        logger.debug(f"Credential {key} not found in any source")
+    return value
+
+def _get_private_key() -> str | None:
+    """
+    Get the private key, either directly from EOA_WALLET_PK or derived from EOA_WALLET_MNEMONIC.
+    
+    Priority order:
+    1. Direct private key from EOA_WALLET_PK (if provided)
+    2. Derived from mnemonic phrase (EOA_WALLET_MNEMONIC) using BIP44 standard path
+    
+    Returns:
+        The private key as a hex string (with 0x prefix) or None if not found
+    """
+    logger.debug("Getting private key from credentials...")
+    
+    # Step 1: Try to get the private key directly (highest priority)
+    private_key = _get_credential("EOA_WALLET_PK")
+    if private_key:
+        private_key = private_key.strip()
+        if not private_key.startswith("0x"):
+            private_key = "0x" + private_key
+        logger.info("✓ Using private key directly from EOA_WALLET_PK")
+        logger.debug(f"Private key length: {len(private_key)} characters")
+        return private_key
+    
+    # Step 2: If no direct private key, try to derive from mnemonic phrase
+    logger.debug("No direct private key found, attempting to derive from mnemonic...")
+    mnemonic_phrase = _get_credential("EOA_WALLET_MNEMONIC")
+    if mnemonic_phrase:
+        mnemonic_phrase = mnemonic_phrase.strip()
+        if not mnemonic_phrase:
+            logger.warning("Mnemonic phrase is empty")
+            return None
+        
+        # Check if mnemonic support libraries are available
+        if not MNEMONIC_SUPPORT:
+            logger.error("Mnemonic support libraries not installed")
+            logger.warning("Please install: pip install mnemonic bip-utils")
+            logger.warning("Or alternatively: pip install mnemonic hdwallet")
+            logger.warning("Or use EOA_WALLET_PK instead of EOA_WALLET_MNEMONIC")
+            return None
+        
+        try:
+            logger.info("Validating mnemonic phrase...")
+            # Validate mnemonic phrase format (checksum, word count, etc.)
+            mnemo = Mnemonic("english")
+            if not mnemo.check(mnemonic_phrase):
+                logger.error("Invalid mnemonic phrase (checksum or format error)")
+                return None
+            logger.info("✓ Mnemonic phrase validated successfully")
+            
+            # Derive private key using BIP44 standard path for Ethereum
+            # BIP44 path structure: m / purpose' / coin_type' / account' / change / address_index
+            # For Ethereum: m/44'/60'/0'/0/0
+            #   - 44' = BIP44 purpose (hardened)
+            #   - 60' = Ethereum coin type (hardened)
+            #   - 0' = Account index (hardened)
+            #   - 0 = External chain (change)
+            #   - 0 = Address index
+            
+            # Method 1: Try bip_utils first (more reliable and well-maintained)
+            if USE_BIP_UTILS:
+                try:
+                    logger.info("Deriving private key using bip_utils library...")
+                    # Step 1: Generate seed from mnemonic using BIP39
+                    seed_bytes = Bip39SeedGenerator(mnemonic_phrase).Generate()
+                    logger.debug(f"Generated seed: {len(seed_bytes)} bytes")
+                    
+                    # Step 2: Create BIP44 master key from seed for Ethereum
+                    bip44_mst = Bip44.FromSeed(seed_bytes, Bip44Coins.ETHEREUM)
+                    
+                    # Step 3: Navigate the BIP44 path: m/44'/60'/0'/0/0
+                    bip44_acc = bip44_mst.Purpose().Coin().Account(0)  # m/44'/60'/0'
+                    bip44_chg = bip44_acc.Change(Bip44Changes.CHAIN_EXT)  # m/44'/60'/0'/0
+                    bip44_addr = bip44_chg.AddressIndex(0)  # m/44'/60'/0'/0/0
+                    
+                    # Step 4: Extract the private key
+                    private_key = "0x" + bip44_addr.PrivateKey().Raw().ToHex()
+                    logger.info("✓ Successfully derived private key from mnemonic using bip_utils")
+                    logger.debug(f"Derived private key length: {len(private_key)} characters")
+                    return private_key
+                except Exception as exc:
+                    logger.warning(f"bip_utils derivation failed: {exc}, trying hdwallet fallback...")
+                    # Fall through to hdwallet method
+            
+            # Method 2: Fallback to hdwallet library
+            if USE_HDWALLET:
+                logger.info("Deriving private key using hdwallet library...")
+                hdwallet = HDWallet(cryptocurrency=Ethereum)
+                # Try different API methods (hdwallet has inconsistent API across versions)
+                try:
+                    # Method 1: keyword argument (newer API)
+                    hdwallet.from_mnemonic(mnemonic=mnemonic_phrase)
+                    logger.debug("Used hdwallet.from_mnemonic(mnemonic=...) method")
+                except (TypeError, AttributeError):
+                    try:
+                        # Method 2: positional argument (older API)
+                        hdwallet.from_mnemonic(mnemonic_phrase)
+                        logger.debug("Used hdwallet.from_mnemonic(...) positional method")
+                    except (TypeError, AttributeError):
+                        # Method 3: try with Mnemonic object (some versions)
+                        hdwallet.from_mnemonic(mnemo)
+                        logger.debug("Used hdwallet.from_mnemonic(Mnemonic object) method")
+                
+                # Derive using BIP44 path: m/44'/60'/0'/0/0
+                hdwallet.from_path("m/44'/60'/0'/0/0")
+                private_key = hdwallet.private_key()
+                if not private_key.startswith("0x"):
+                    private_key = "0x" + private_key
+                logger.info("✓ Successfully derived private key from mnemonic using hdwallet")
+                logger.debug(f"Derived private key length: {len(private_key)} characters")
+                return private_key
+            
+            # If neither library works, provide helpful error
+            logger.error("No mnemonic derivation library available")
+            logger.error("Please install one of:")
+            logger.error("  pip install bip-utils  (recommended)")
+            logger.error("  pip install hdwallet")
+            return None
+            
+        except Exception as exc:
+            logger.error(f"Error deriving private key from mnemonic: {exc}", exc_info=True)
+            logger.error("Make sure you have installed: pip install mnemonic bip-utils")
+            logger.error("Or alternatively: pip install mnemonic hdwallet")
+            return None
+    
+    # No private key or mnemonic found
+    logger.warning("No private key or mnemonic found in credentials")
+    return None
 
 def select_credential_set():
     """
@@ -732,11 +933,11 @@ def _place_order_now(market: dict, chosen_outcome_name: str | None = None, chose
     """
     global CURRENT_SESSION
     if not CURRENT_SESSION:
-        print("No active trading session. Create a session first in the Trading Menu.")
+        logger.error("No active trading session. Create a session first in the Trading Menu.")
         return
     market_id = market.get("id") or market.get("marketId") or market.get("_id")
     if not market_id:
-        print("Selected market missing id.")
+        logger.error("Selected market missing id.")
         return
     
     market_title = market.get("title") or market.get("question") or market.get("name") or "Unknown Market"
@@ -855,12 +1056,12 @@ def start_trading_flow():
     if wallet_address:
         account_exists = check_account_exists(wallet_address)
         if account_exists is False:
-            print("\n✗ Account not found")
-            print("="*60)
-            print("You need to complete your account creation on Almanac first.")
-            print("Please visit https://almanac.market to create your account,")
-            print("then try trading again.")
-            print("="*60)
+            logger.error("✗ Account not found")
+            logger.error("="*60)
+            logger.error("You need to complete your account creation on Almanac first.")
+            logger.error("Please visit https://almanac.market to create your account,")
+            logger.error("then try trading again.")
+            logger.error("="*60)
             return
         elif account_exists is None:
             # Error checking account, but proceed anyway
@@ -868,24 +1069,28 @@ def start_trading_flow():
     
     # Auto-create session if none exists
     if not CURRENT_SESSION:
-        print("\nNo active trading session detected. Creating one now...")
+        logger.info("No active trading session detected, creating new session...")
         try:
             session = initiate_trading_session()
             if session:
-                print("Trading session created successfully.")
+                logger.info("✓ Trading session created successfully")
                 CURRENT_SESSION = session
+                # Log session details (without sensitive data)
+                if session.get('data', {}).get('sessionId'):
+                    logger.debug(f"Session ID: {session['data']['sessionId']}")
+                    logger.debug(f"Proxy wallet: {session['data'].get('proxyWallet', 'N/A')}")
             else:
-                print("Failed to create trading session. Please check your configuration.")
+                logger.error("Failed to create trading session. Please check your configuration.")
                 return
         except Exception as exc:
-            print(f"Failed to create trading session: {exc}")
+            logger.error(f"Exception creating trading session: {exc}", exc_info=True)
             return
     
     while True:
-        print("\nTrading Menu:")
-        print("  1) Search and Trade Markets")
-        print("  2) Refresh Trading Session")
-        print("  3) Back to Main Menu")
+        logger.info("\nTrading Menu:")
+        logger.info("  1) Search and Trade Markets")
+        logger.info("  2) Refresh Trading Session")
+        logger.info("  3) Back to Main Menu")
         choice = input("\nEnter choice: ").strip()
 
         if choice == "1":
@@ -894,31 +1099,38 @@ def start_trading_flow():
             try:
                 session = initiate_trading_session()
                 if session:
-                    print("\nTrading session refreshed.")
+                    logger.info("Trading session refreshed.")
                     CURRENT_SESSION = session
                 else:
-                    print("Trading session could not be refreshed.")
+                    logger.error("Trading session could not be refreshed.")
             except Exception as exc:
-                print(f"Failed to refresh trading session: {exc}")
+                logger.error(f"Failed to refresh trading session: {exc}")
         elif choice == "3":
             break
         else:
-            print("Invalid choice. Please enter a number from 1 to 3.\n")
+            logger.warning("Invalid choice. Please enter a number from 1 to 3.")
 
 def initiate_trading_session():
     """
     Initiate a trading session with the Almanac API.
+    
+    This function:
+    1. Loads wallet credentials (address and private key/mnemonic)
+    2. Validates that the private key matches the wallet address
+    3. Signs a message using EIP-191 (personal_sign) standard
+    4. Sends the signed message to Almanac API to create a trading session
+    5. Returns session data including sessionId, proxyWallet, and expiration
 
+    Request format:
     {
         "signature": "0x...",
-        "message": "Create Almanac trading session",  # human-readable action text
+        "message": "Create Almanac trading session",
         "walletAddress": "0x...",
         "apiCredentials": {
             "apiKey": "string",
             "secret": "base64-string",
             "passphrase": "string"
-        },
-        "userAgent": "optional string"
+        }
     }
 
     Returns:
@@ -933,66 +1145,88 @@ def initiate_trading_session():
         'timestamp': '2025-11-16T15:10:50.983Z'
     }
     """
+    logger.info("Initiating trading session with Almanac API...")
     load_dotenv(dotenv_path=str(ENV_PATH))
 
-    # Load wallet address and private key
+    # Step 1: Load wallet address and private key
+    logger.debug("Loading wallet credentials...")
     wallet_address = _get_credential("EOA_WALLET_ADDRESS")
     if not wallet_address:
-        print(f"EOA_WALLET_ADDRESS not found in {ENV_PATH}. Please set it and try again.")
+        logger.error(f"EOA_WALLET_ADDRESS not found in {ENV_PATH}. Please set it and try again.")
         return
     
-    private_key = _get_credential("EOA_WALLET_PK")
+    logger.debug(f"Wallet address: {wallet_address}")
+    private_key = _get_private_key()
     if not private_key:
-        print(f"EOA_WALLET_PK not found in {ENV_PATH}. Please set it and try again.")
+        logger.error("Private key or mnemonic not found")
+        print(f"EOA_WALLET_PK or EOA_WALLET_MNEMONIC not found in {ENV_PATH}. Please set one of them and try again.")
         return
-    if not private_key.startswith("0x"):
-        private_key = "0x" + private_key
     
-    # Validate address derives cleanly (optional)
+    # Step 2: Validate that the private key matches the wallet address
+    # This is a security check to ensure credentials are correct
+    logger.debug("Validating private key matches wallet address...")
     try:
         addr = Account.from_key(private_key).address.lower()
         if addr != wallet_address.lower():
-            print(f"Private key does not match wallet address: {addr} != {wallet_address}")
+            logger.error(f"Private key mismatch: derived {addr} != configured {wallet_address}")
             return
+        logger.info("✓ Private key matches wallet address")
     except Exception as exc:
-        print(f"Invalid private key: {exc}")
+        logger.error(f"Invalid private key: {exc}")
         return
 
-    # Prepare EIP-191 message (personal_sign). Include nonce/timestamp to prevent replay.
+    # Step 3: Prepare EIP-191 message signature (personal_sign standard)
+    # EIP-191 is the Ethereum standard for signing messages
+    # The message is signed with the private key to prove ownership
+    logger.debug("Preparing EIP-191 message signature...")
     action = "Create Almanac trading session"
-    nonce = secrets.token_hex(16)
+    nonce = secrets.token_hex(16)  # Random nonce to prevent replay attacks
     timestamp = int(time.time())
-    #message = f"{action}\nwallet:{wallet_address}\nchainId:{POLYGON_CHAIN_ID}\nnonce:{nonce}\ntimestamp:{timestamp}"
-    message = action
-    msg = encode_defunct(text=message)
+    message = action  # Simple message for now
+    msg = encode_defunct(text=message)  # Encode message in EIP-191 format
     signed = Account.from_key(private_key).sign_message(msg)
     signature = signed.signature.hex() if hasattr(signed.signature, "hex") else signed.signature
     if not isinstance(signature, str):
         signature = str(signature)
     if not signature.startswith("0x"):
         signature = "0x" + signature
+    logger.debug(f"Message signed: {signature[:20]}...")
 
+    # Step 4: Prepare Polymarket API credentials (optional, can be empty)
     api_keys = {
         "apiKey": _get_credential("POLYMARKET_API_KEY"),
         "secret": _get_credential("POLYMARKET_API_SECRET"),
         "passphrase": _get_credential("POLYMARKET_API_PASSPHRASE")
     }
+    logger.debug("Polymarket API credentials loaded (may be empty)")
 
+    # Step 5: Send request to Almanac API
+    logger.info(f"Sending trading session request to {ALMANAC_API_URL}/v1/trading/sessions...")
     response = requests.post(f'{ALMANAC_API_URL}/v1/trading/sessions', 
         headers={'Content-Type': 'application/json'},
         json={
         'signature': signature,
-        'message': message,  # full message that was signed (contains action+nonce+timestamp)
+        'message': message,
         'walletAddress': wallet_address,
         'nonce': nonce,
         'timestamp': timestamp,
         'apiCredentials': api_keys
     })
+    
     if response.status_code != 200:
-        print(f"Failed to create trading session:")
-        print(json.dumps(response.json(), indent=2))
+        logger.error(f"Failed to create trading session: HTTP {response.status_code}")
+        try:
+            error_data = response.json()
+            logger.error(f"Error response: {json.dumps(error_data)}")
+        except Exception:
+            logger.error(f"Error response (text): {response.text}")
         return None
-    return response.json()
+    
+    logger.info("✓ Trading session created successfully")
+    session_data = response.json()
+    if session_data.get('data', {}).get('sessionId'):
+        logger.debug(f"Session ID: {session_data['data']['sessionId']}")
+    return session_data
 
 def place_order(
     market_id: str,
@@ -1026,7 +1260,7 @@ def place_order(
     """
     global CURRENT_SESSION
     if not CURRENT_SESSION:
-        print("No active trading session. Create a session first.")
+        logger.error("No active trading session. Create a session first.")
         return
 
     session_id = (
@@ -1048,13 +1282,16 @@ def place_order(
         headers["x-wallet-address"] = wallet_address
 
     # Attempt EIP-712 signed order flow if config present
+    # EIP-712 is a standard for signing typed structured data (more secure than plain text)
+    # Different exchange contracts for regular vs negative risk markets
     exchange_address = EIP712_DOMAIN_NEGRISK_CONTRACT if neg_risk else EIP712_DOMAIN_CONTRACT
-    private_key = _get_credential("EOA_WALLET_PK")
+    logger.debug(f"Using exchange contract: {exchange_address} (neg_risk={neg_risk})")
+    
+    private_key = _get_private_key()
     signed_flow_payload = None
     try:
         if exchange_address and private_key and wallet_address:
-            if not private_key.startswith("0x"):
-                private_key = "0x" + private_key
+            logger.info("Building EIP-712 signed order...")
             # Numeric fields as ints for EIP-712
             # Match TypeScript logic: round to 2 decimals, then multiply by 1e6, then round to integer
             def round_to_decimals(x: float, decimals: int = 2) -> float:
@@ -1067,13 +1304,20 @@ def place_order(
                 rounded = round_to_decimals(x, 2)
                 return int(round(rounded * 1_000_000))
             
-            # Build order payload
+            # Build order payload for EIP-712 signature
+            # Side: 0 = BUY, 1 = SELL
             side_num = 0 if side_upper == "BUY" else 1
-            # use BigInt(Date.now()) for salt
-            salt = int(time.time() * 1000)
+            logger.debug(f"Order side: {side_upper} (numeric: {side_num})")
             
-            # Size is shares, apply ±0.01 price adjustment for leeway
+            # Salt: unique identifier for this order (timestamp in milliseconds)
+            # Prevents order replay attacks
+            salt = int(time.time() * 1000)
+            logger.debug(f"Order salt: {salt}")
+            
+            # Price adjustment logic: apply ±0.01 price adjustment for leeway
             # This ensures effective price is slightly worse to prevent rejection due to rounding
+            # BUY orders: adjust price UP (+0.01) to ensure we pay enough
+            # SELL orders: adjust price DOWN (-0.01) to ensure we get enough
             if side_num == 0:  # BUY
                 # For BUY: size is shares we want to receive
                 # Adjust price upward (+0.01) to ensure effective price >= orderbook price
@@ -1174,6 +1418,7 @@ def place_order(
                 "side": order_payload["side"],
                 "signatureType": order_payload["signatureType"],
             }
+            # Package the signed order for API submission
             signed_flow_payload = {
                 "marketId": market_id,
                 "signedOrder": {
@@ -1183,18 +1428,24 @@ def place_order(
                 "orderType": order_type,
                 "userWalletAddress": wallet_address,
             }
+            logger.info("✓ EIP-712 order signed successfully")
+            logger.debug(f"Order payload: marketId={market_id}, orderType={order_type}")
     except Exception as _exc:
         # Fallback to simple flow below if signing fails
+        logger.error(f"Failed to build signed order: {_exc}", exc_info=True)
         signed_flow_payload = None
         import traceback
         traceback.print_exc()
 
     if signed_flow_payload is None:
-        print("Failed to build signed order payload. Aborting without sending.")
+        logger.error("Failed to build signed order payload. Aborting without sending.")
         return
     payload = signed_flow_payload
 
+    # Submit the order to Almanac API
     try:
+        logger.info(f"Submitting order to {ALMANAC_API_URL}/v1/trading/orders...")
+        logger.debug(f"Order details: marketId={market_id}, side={side_upper}, size={size}, price={price}")
         resp = requests.post(
             f"{ALMANAC_API_URL}/v1/trading/orders",
             headers=headers,
@@ -1202,16 +1453,18 @@ def place_order(
             timeout=30,
         )
         if resp.status_code != 200:
-            print("Failed to place order:")
+            logger.error(f"Order submission failed: HTTP {resp.status_code}")
             try:
-                print(json.dumps(resp.json(), indent=2))
+                error_data = resp.json()
+                logger.error(f"Error response: {json.dumps(error_data)}")
             except Exception:
-                print(resp.text)
+                logger.error(f"Error response (text): {resp.text}")
             return
-        print("Order placed:")
-        print(json.dumps(resp.json(), indent=2))
+        logger.info("✓ Order placed successfully")
+        result = resp.json()
+        logger.info(f"Order response: {json.dumps(result, indent=2)}")
     except Exception as exc:
-        print(f"Order error: {exc}")
+        logger.error(f"Exception placing order: {exc}", exc_info=True)
 
 def search_markets():
     """
@@ -1436,24 +1689,22 @@ def initiate_wallet_session():
     # Load wallet address and private key
     wallet_address = _get_credential("EOA_WALLET_ADDRESS")
     if not wallet_address:
-        print(f"EOA_WALLET_ADDRESS not found in {ENV_PATH}. Please set it and try again.")
+        logger.error(f"EOA_WALLET_ADDRESS not found in {ENV_PATH}. Please set it and try again.")
         return None
     
-    private_key = _get_credential("EOA_WALLET_PK")
+    private_key = _get_private_key()
     if not private_key:
-        print(f"EOA_WALLET_PK not found in {ENV_PATH}. Please set it and try again.")
+        logger.error(f"EOA_WALLET_PK or EOA_WALLET_MNEMONIC not found in {ENV_PATH}. Please set one of them and try again.")
         return None
-    if not private_key.startswith("0x"):
-        private_key = "0x" + private_key
     
     # Validate address derives cleanly (optional)
     try:
         addr = Account.from_key(private_key).address.lower()
         if addr != wallet_address.lower():
-            print(f"Private key does not match wallet address: {addr} != {wallet_address}")
+            logger.error(f"Private key does not match wallet address: {addr} != {wallet_address}")
             return None
     except Exception as exc:
-        print(f"Invalid private key: {exc}")
+        logger.error(f"Invalid private key: {exc}")
         return None
 
     # Prepare EIP-191 message (personal_sign)
@@ -1477,11 +1728,11 @@ def initiate_wallet_session():
         }
     )
     if response.status_code != 200:
-        print(f"Failed to create wallet session:")
+        logger.error("Failed to create wallet session")
         try:
-            print(json.dumps(response.json(), indent=2))
+            logger.error(f"Error response: {json.dumps(response.json(), indent=2)}")
         except Exception:
-            print(response.text)
+            logger.error(f"Error response (text): {response.text}")
         return None
     return response.json()
 
@@ -1769,38 +2020,61 @@ def link_bittensor_uid():
 
 def generate_polymarket_credentials():
     """
-    Generate Polymarket CLOB API credentials using py-clob-client with EOA_WALLET_PK from api_trading.env.
+    Generate Polymarket CLOB API credentials using py-clob-client.
+    
+    This function:
+    1. Loads wallet private key (from EOA_WALLET_PK or EOA_WALLET_MNEMONIC)
+    2. Validates the private key by deriving the wallet address
+    3. Uses py-clob-client to generate/derive Polymarket API credentials
+    4. Displays the credentials for the user to add to their .env file
+    
+    The credentials are used for authenticating with Polymarket's CLOB API.
     """
     global CREDENTIAL_SETS, SELECTED_CREDENTIAL_SET, CURRENT_SESSION, SELECTED_MARKET
     
+    logger.info("Generating Polymarket API credentials...")
     print("\nGenerating Polymarket API credentials...")
     load_dotenv(dotenv_path=str(ENV_PATH))
-    private_key = _get_credential("EOA_WALLET_PK")
+    
+    # Step 1: Get private key
+    private_key = _get_private_key()
     if not private_key:
-        print(f"EOA_WALLET_PK not found in {ENV_PATH}. Please set it and try again.")
+        logger.error("Private key or mnemonic not found")
+        print(f"EOA_WALLET_PK or EOA_WALLET_MNEMONIC not found in {ENV_PATH}. Please set one of them and try again.")
         return
 
-    # Validate address derives cleanly (optional)
+    # Step 2: Validate private key by deriving address
+    logger.debug("Validating private key by deriving address...")
     try:
         addr = Account.from_key(private_key).address
+        logger.info(f"Using wallet: {addr}")
         print(f"Using wallet: {addr}")
     except Exception as exc:
-        print(f"Invalid private key: {exc}")
+        logger.error(f"Invalid private key: {exc}")
         return
 
+    # Step 3: Get proxy funder address (required for Polymarket)
     proxy_funder_address = _get_credential("EOA_PROXY_FUNDER")
     if not proxy_funder_address:
+        logger.error("EOA_PROXY_FUNDER not found")
         print(f"EOA_PROXY_FUNDER not found in {ENV_PATH}. Please set it and try again.")
         return
+    logger.debug(f"Proxy funder address: {proxy_funder_address}")
 
-    # Create client and generate credentials
+    # Step 4: Create ClobClient and generate credentials
+    # ClobClient uses the private key to sign requests and generate API credentials
+    logger.info(f"Connecting to Polymarket CLOB at {POLYMARKET_CLOB_HOST}...")
     client = ClobClient(host=POLYMARKET_CLOB_HOST, key=private_key, chain_id=POLYGON_CHAIN_ID)
     try:
+        logger.info("Generating API credentials...")
         credentials = client.create_or_derive_api_creds()
+        logger.info("✓ API credentials generated successfully")
     except Exception as exc:
+        logger.error(f"Failed to create Polymarket API credentials: {exc}", exc_info=True)
         print(f"Failed to create Polymarket API credentials: {exc}")
         return
 
+    # Step 5: Display credentials for user to copy
     _display_credentials(credentials)
     
     # Prompt to reload environment file
