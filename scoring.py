@@ -301,10 +301,10 @@ def build_epoch_history(
                 continue
             entity_id = miner_id
             if miner_id not in miner_profiles:
-                miner_profiles[miner_id] = trade["profile_id"]
+                miner_profiles[miner_id] = trade["profile_id"].lower()
             elif miner_profiles[miner_id] != trade["profile_id"]:
                 # append additional profile ids to be validated later in the validator
-                miner_profiles[miner_id] += f",{trade['profile_id']}"
+                miner_profiles[miner_id] += f",{trade['profile_id'].lower()}"
 
         else:
             # General pool
