@@ -308,11 +308,14 @@ def build_epoch_history(
             if miner_id not in all_uids or miner_id >= len(all_hotkeys) or all_hotkeys[miner_id] != miner_hotkey:
                 continue
             entity_id = miner_id
-            if miner_id not in miner_profiles:
-                miner_profiles[miner_id] = trade["profile_id"].lower()
-            elif miner_profiles[miner_id] != trade["profile_id"]:
-                # append additional profile ids to be validated later in the validator
-                miner_profiles[miner_id] += f",{trade['profile_id'].lower()}"
+            is_reward_eligible = trade["is_reward_eligible"]
+            # If the trade is reward eligible, add the profile id to the miner profiles
+            if is_reward_eligible:
+                if miner_id not in miner_profiles:
+                    miner_profiles[miner_id] = trade["profile_id"].lower()
+                elif miner_profiles[miner_id] != trade["profile_id"]:
+                    # append additional profile ids to be validated later in the validator
+                    miner_profiles[miner_id] += f",{trade['profile_id'].lower()}"
 
         else:
             # General pool
