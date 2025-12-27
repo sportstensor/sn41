@@ -294,6 +294,9 @@ def build_epoch_history(
         if trade_date < epoch_dates[0] or trade_date >= today.date():
             continue  # outside our window
         epoch_idx = (trade_date - epoch_dates[0]).days
+
+        # Get account ID and map to entity_id
+        account_id = trade["account_id"]
         
         # Filter by pool type
         if is_miner_pool:
@@ -316,17 +319,18 @@ def build_epoch_history(
                 elif miner_profiles[miner_id] != trade["profile_id"]:
                     # append additional profile ids to be validated later in the validator
                     miner_profiles[miner_id] += f",{trade['profile_id'].lower()}"
+                # Map the entity id to the account id only if the trade is reward eligible
+                if entity_id not in account_map:
+                    account_map[entity_id] = account_id
 
         else:
             # General pool
             if not trade["is_general_pool"]:
                 continue
             entity_id = trade["profile_id"]
-
-        # Get account ID and map to entity_id
-        account_id = trade["account_id"]
-        if entity_id not in account_map:
-            account_map[entity_id] = account_id
+            # Map the profile id to the account id
+            if entity_id not in account_map:
+                account_map[entity_id] = account_id
                         
         entity_set.add(entity_id)
         epoch_trades[epoch_idx].append((entity_id, trade))
