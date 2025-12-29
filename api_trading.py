@@ -897,18 +897,17 @@ def _place_order_now(market: dict, chosen_outcome_name: str | None = None, chose
     
     # Order type input with cancel option
     print("\nOrder Type:")
+    print("  GTC - Good Till Canceled: Limit order remains active until filled or cancelled")
     print("  FOK - Fill Or Kill: Market Order must be filled immediately or it's cancelled")
     print("  FAK - Fill And Kill: Market Order will be filled immediately with what is available and the rest cancelled")
-    # GTC and GTD are not supported yet
-    #print("  GTC - Good Till Canceled: Limit order remains active until filled or cancelled")
-    order_type_input = input("Order type (fok/fak/cancel/c) [fok]: ").strip().upper()
+    order_type_input = input("Order type (gtc/fok/fak/cancel/c) [gtc]: ").strip().upper()
     if order_type_input in ("C", "CANCEL"):
         print("Order cancelled.")
         return
-    order_type = order_type_input or "FOK"
-    if order_type not in ("FOK", "FAK"):
-        print("Order type must be 'FOK' or 'FAK'. Using default 'FOK'.")
-        order_type = "FOK"
+    order_type = order_type_input or "GTC"
+    if order_type not in ("GTC", "FOK", "FAK"):
+        print("Order type must be 'GTC', 'FOK', or 'FAK'. Using default 'GTC'.")
+        order_type = "GTC"
     
     side_upper = "BUY" if side == "buy" else "SELL"
     
@@ -1890,7 +1889,7 @@ def place_order(
     size: float,
     price: float,
     neg_risk: bool = False,
-    order_type: str = "FOK",
+    order_type: str = "GTC",
     chosen_outcome_name: str | None = None,
     chosen_token_id: str | None = None,
 ):
@@ -1905,7 +1904,7 @@ def place_order(
       - marketId: string (required)
       - tokenId: string (optional)
       - side: "BUY" | "SELL" (optional)
-      - orderType: "FOK" | "FAK" (optional; default "FOK"; "GTC" and "GTD" are not supported yet)
+      - orderType: "GTC" | "FOK" | "FAK" (optional; default "GTC")
       - price: float between 0.01 and 0.99 (optional)
       - size: float >= POLYMARKET_MIN_ORDER (optional)
       - signature: string (optional)
