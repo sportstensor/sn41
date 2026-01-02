@@ -897,29 +897,32 @@ def _place_order_now(market: dict, chosen_outcome_name: str | None = None, chose
     
     # Order type input with cancel option
     print("\nOrder Type:")
+    print("  GTC - Good Till Canceled: Limit order remains active until filled or cancelled")
     print("  FOK - Fill Or Kill: Market Order must be filled immediately or it's cancelled")
     print("  FAK - Fill And Kill: Market Order will be filled immediately with what is available and the rest cancelled")
-    # GTC and GTD are not supported yet
-    #print("  GTC - Good Till Canceled: Limit order remains active until filled or cancelled")
-    order_type_input = input("Order type (fok/fak/cancel/c) [fok]: ").strip().upper()
+    order_type_input = input("Order type (gtc/fok/fak/cancel/c) [gtc]: ").strip().upper()
     if order_type_input in ("C", "CANCEL"):
         print("Order cancelled.")
         return
-    order_type = order_type_input or "FOK"
-    if order_type not in ("FOK", "FAK"):
-        print("Order type must be 'FOK' or 'FAK'. Using default 'FOK'.")
-        order_type = "FOK"
+    order_type = order_type_input or "GTC"
+    if order_type not in ("GTC", "FOK", "FAK"):
+        print("Order type must be 'GTC', 'FOK', or 'FAK'. Using default 'GTC'.")
+        order_type = "GTC"
     
     side_upper = "BUY" if side == "buy" else "SELL"
     
-    # Apply the same price adjustment logic that place_order() uses
+    # Apply the same price adjustment logic that place_order() uses. Only for Market Orders (FOK, FAK).
     # This ensures the order summary shows the actual values that will be sent to the API
-    if side_upper == "BUY":
-        adjusted_price = price + PRICE_BUFFER_ADJUSTMENT
-        price_note = f"(+${PRICE_BUFFER_ADJUSTMENT} buffer for {side_upper} orders)"
-    else:  # SELL
-        adjusted_price = max(0.01, price - PRICE_BUFFER_ADJUSTMENT)
-        price_note = f"(-${PRICE_BUFFER_ADJUSTMENT} buffer for {side_upper} orders)"
+    if order_type in ("FOK", "FAK"):
+        if side_upper == "BUY":
+            adjusted_price = price + PRICE_BUFFER_ADJUSTMENT
+            price_note = f"(+${PRICE_BUFFER_ADJUSTMENT} buffer for {side_upper} orders)"
+        else:  # SELL
+            adjusted_price = max(0.01, price - PRICE_BUFFER_ADJUSTMENT)
+            price_note = f"(-${PRICE_BUFFER_ADJUSTMENT} buffer for {side_upper} orders)"
+    else:
+        adjusted_price = price
+        price_note = ""
     
     # Calculate with adjusted price (what will actually be sent to API)
     notional = size * adjusted_price
@@ -937,8 +940,11 @@ def _place_order_now(market: dict, chosen_outcome_name: str | None = None, chose
     print(f"Side: {side_upper}")
     print(f"Order Type: {order_type}")
     print(f"Size: {size}")
-    print(f"Requested Price: {price}")
-    print(f"Adjusted Price: {adjusted_price} {price_note}")
+    if adjusted_price != price:
+        print(f"Requested Price: {price}")
+        print(f"Adjusted Price: {adjusted_price} {price_note}")
+    else:
+        print(f"Price: {price}")
     print(f"Subtotal: ${notional:.2f}")
     print(f"Platform Fee ({VOLUME_FEE*100:.1f}%): ${fee:.2f}")
     print(f"Total: ${total_with_fee:.2f}")
@@ -1060,6 +1066,116 @@ def fetch_positions_summary():
         return response.json()
     except Exception as exc:
         print(f"Error fetching positions summary: {exc}")
+        return None
+
+def fetch_orders(status: str | None = None, limit: int = 100, offset: int = 0):
+    """
+    Fetch user's orders from the Almanac API.
+    
+    Args:
+        status: Order status filter ('live', 'delayed', 'matched', 'completed', 'pending', 'cancelled', 'expired', 'failed', or None for all)
+        limit: Maximum number of orders to return (1-100)
+        offset: Number of orders to skip
+    
+    Returns:
+        Response data with orders or None if error
+    """
+    global CURRENT_SESSION
+    if not CURRENT_SESSION:
+        print("No active trading session. Create a session first.")
+        return None
+    
+    session_id = CURRENT_SESSION.get("data").get("sessionId")
+    wallet_address = (
+        CURRENT_SESSION.get("data").get("walletAddress")
+        or _get_credential("EOA_WALLET_ADDRESS")
+    )
+    
+    headers = {"Content-Type": "application/json"}
+    if session_id:
+        headers["x-session-id"] = session_id
+    if wallet_address:
+        headers["x-wallet-address"] = wallet_address
+    
+    params = {
+        "limit": limit,
+        "offset": offset
+    }
+    
+    # Add status parameter if provided
+    if status:
+        params["status"] = status
+    
+    try:
+        response = requests.get(
+            f"{ALMANAC_API_URL}/v1/trading/orders",
+            headers=headers,
+            params=params,
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            print("Failed to fetch orders:")
+            try:
+                print(json.dumps(response.json(), indent=2))
+            except Exception:
+                print(response.text)
+            return None
+        
+        return response.json()
+    except Exception as exc:
+        print(f"Error fetching orders: {exc}")
+        return None
+
+def cancel_order(order_id: str):
+    """
+    Cancel an unmatched order using session-based authentication.
+    
+    Args:
+        order_id: The order ID to cancel (e.g., "0x1234...")
+    
+    Returns:
+        Response data with success status and order details or None if error
+    """
+    global CURRENT_SESSION
+    if not CURRENT_SESSION:
+        print("No active trading session. Create a session first.")
+        return None
+    
+    session_id = CURRENT_SESSION.get("data").get("sessionId")
+    wallet_address = (
+        CURRENT_SESSION.get("data").get("walletAddress")
+        or _get_credential("EOA_WALLET_ADDRESS")
+    )
+    
+    if not session_id or not wallet_address:
+        print("Missing session ID or wallet address.")
+        return None
+    
+    headers = {
+        "Content-Type": "application/json",
+        "x-session-id": session_id,
+        "x-wallet-address": wallet_address.lower()
+    }
+    
+    try:
+        response = requests.delete(
+            f"{ALMANAC_API_URL}/v1/trading/orders/{order_id}",
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            print("Failed to cancel order:")
+            try:
+                print(json.dumps(response.json(), indent=2))
+            except Exception:
+                print(response.text)
+            return None
+        
+        return response.json()
+    except Exception as exc:
+        print(f"Error cancelling order: {exc}")
         return None
 
 def _format_position_value(value, is_pnl=False, is_current_value=False):
@@ -1268,6 +1384,248 @@ def _display_positions(positions_data):
     print("=" * 80)
     
     return pagination_info, positions
+
+def _display_orders(orders_data):
+    """
+    Display orders in a user-friendly format.
+    
+    Args:
+        orders_data: Response data from fetch_orders (dict with 'data' key containing orders list)
+    
+    Returns:
+        tuple: (pagination_info dict, orders list)
+    """
+    if not orders_data:
+        print("No orders data received.")
+        return None, []
+    
+    # Extract orders list from response
+    orders = []
+    pagination_info = None
+    
+    if isinstance(orders_data, dict):
+        orders = orders_data.get("data", [])
+        if not isinstance(orders, list):
+            # Try other common response shapes
+            orders = orders_data.get("orders", [])
+            if not isinstance(orders, list):
+                orders = []
+        
+        # Extract pagination info
+        pagination = orders_data.get("pagination", {})
+        if pagination:
+            pagination_info = {
+                "has_more": pagination.get("hasMore", False),
+                "offset": pagination.get("offset", 0),
+                "limit": pagination.get("limit", DEFAULT_POSITIONS_LIMIT),
+                "total": pagination.get("total", len(orders))
+            }
+    elif isinstance(orders_data, list):
+        orders = orders_data
+    
+    if not orders:
+        print("\nNo orders found.")
+        return pagination_info, []
+    
+    # Build table rows
+    table_rows = []
+    for idx, order in enumerate(orders, start=1):
+        # Market information - use marketQuestion from API
+        market_question = order.get("marketQuestion") or order.get("title") or order.get("marketTitle") or "Unknown Market"
+        
+        # Outcome information
+        outcome = order.get("outcome") or "-"
+        
+        # Side (BUY/SELL)
+        side = order.get("side") or order.get("orderSide") or "-"
+        if isinstance(side, str):
+            side = side.upper()
+        
+        # Order details
+        # API returns price and size as floats already, but handle both cases
+        size_val = order.get("size") or order.get("quantity") or 0
+        try:
+            size = float(size_val)
+        except (ValueError, TypeError):
+            size = 0.0
+        
+        price_val = order.get("price") or 0
+        try:
+            price = float(price_val)
+        except (ValueError, TypeError):
+            price = 0.0
+        
+        order_type = order.get("orderType") or order.get("order_type") or order.get("type") or "GTC"
+        
+        # Status
+        status = order.get("status") or order.get("orderStatus") or "unknown"
+        if isinstance(status, str):
+            status = status.capitalize()
+        
+        # Filled size (if partially filled) - API returns as float
+        filled_size_val = order.get("filledSize") or order.get("filled_size") or order.get("filled") or 0
+        try:
+            filled_size = float(filled_size_val)
+        except (ValueError, TypeError):
+            filled_size = 0.0
+        
+        # Timestamps
+        created_at = order.get("createdAt") or order.get("created_at") or order.get("timestamp")
+        completed_at = order.get("completedAt") or order.get("completed_at")
+        
+        # Build row with index as first column
+        row = [
+            str(idx),
+            _truncate_text(market_question, 35),
+            outcome,
+            side,
+            f"{size:.2f}",
+            _format_position_value(price),
+            f"{filled_size:.2f}" if filled_size > 0 else "-",
+            order_type,
+            status,
+            _format_timestamp(created_at),
+            _format_timestamp(completed_at) if completed_at else "-",
+        ]
+        table_rows.append(row)
+    
+    # Define table headers
+    headers = [
+        "#",
+        "Market",
+        "Outcome",
+        "Side",
+        "Size",
+        "Price",
+        "Filled",
+        "Type",
+        "Status",
+        "Created",
+        "Completed At"
+    ]
+    
+    # Calculate summary statistics using actual API status values
+    status_counts = {}
+    for o in orders:
+        status = (o.get("status") or "").lower()
+        status_counts[status] = status_counts.get(status, 0) + 1
+    
+    # Build summary string
+    status_summary_parts = []
+    for status_key in ["live", "delayed", "matched", "completed", "pending", "cancelled", "expired", "failed"]:
+        count = status_counts.get(status_key, 0)
+        if count > 0:
+            status_summary_parts.append(f"{count} {status_key.capitalize()}")
+    
+    # Include any other statuses not in the standard list
+    for status_key, count in status_counts.items():
+        if status_key not in ["live", "delayed", "matched", "completed", "pending", "cancelled", "expired", "failed"]:
+            if count > 0:
+                status_summary_parts.append(f"{count} {status_key.capitalize()}")
+    
+    status_summary = ", ".join(status_summary_parts) if status_summary_parts else "0"
+    
+    # Print table
+    if pagination_info:
+        total_display = pagination_info.get("total", len(orders))
+        current_range_start = pagination_info.get("offset", 0) + 1
+        current_range_end = pagination_info.get("offset", 0) + len(orders)
+        print(f"\nOrders (showing {current_range_start}-{current_range_end} of {total_display}):")
+    else:
+        print(f"\nOrders ({len(orders)} found):")
+    
+    print(tabulate(table_rows, headers=headers, tablefmt="grid", stralign="left"))
+    
+    # Print summary
+    print("\n" + "=" * 80)
+    print("Summary:")
+    print("=" * 80)
+    print(f"Total Orders: {len(orders)} ({status_summary})")
+    print("=" * 80)
+    
+    return pagination_info, orders
+
+def _select_order_for_cancel(orders: list):
+    """
+    Allow user to select an order from the list and cancel it.
+    
+    Args:
+        orders: List of order dicts
+    """
+    if not orders:
+        print("No orders available.")
+        return
+    
+    # Prompt for order selection
+    print("\nCancel an order (or Enter to cancel):")
+    try:
+        choice = input("Order number: ").strip()
+        if not choice:
+            print("Cancelled.")
+            return
+        
+        order_idx = int(choice) - 1
+        if order_idx < 0 or order_idx >= len(orders):
+            print("Invalid order number.")
+            return
+        
+        selected_order = orders[order_idx]
+        
+        # Get order details
+        order_id = selected_order.get("orderId") or selected_order.get("order_id") or selected_order.get("id")
+        if not order_id:
+            print("Order missing order ID.")
+            return
+        
+        # Check if order can be cancelled (should be live or delayed)
+        status = (selected_order.get("status") or "").lower()
+        if status not in ("live", "delayed"):
+            print(f"Cannot cancel order with status: {status}")
+            print("Only live or delayed orders can be cancelled.")
+            return
+        
+        # Show order details
+        market_question = selected_order.get("marketQuestion") or "Unknown Market"
+        outcome = selected_order.get("outcome") or "-"
+        side = selected_order.get("side") or "-"
+        size = selected_order.get("size") or 0
+        price = selected_order.get("price") or 0
+        
+        print(f"\nSelected order:")
+        print(f"  Market: {market_question}")
+        print(f"  Outcome: {outcome}")
+        print(f"  Side: {side}")
+        print(f"  Size: {size}")
+        print(f"  Price: {price}")
+        print(f"  Status: {status}")
+        
+        # Confirm cancellation
+        confirm = input("\nAre you sure you want to cancel this order? (y/n): ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Cancellation cancelled.")
+            return
+        
+        # Cancel the order
+        print("\nCancelling order...")
+        result = cancel_order(order_id)
+        
+        if result:
+            if result.get("success"):
+                print("✓ Order cancelled successfully")
+                if result.get("data"):
+                    print(json.dumps(result.get("data"), indent=2))
+            else:
+                error_msg = result.get("error", "Unknown error")
+                user_msg = result.get("userMessage", error_msg)
+                print(f"✗ Error: {error_msg}")
+                print(f"  Message: {user_msg}")
+        else:
+            print("Failed to cancel order.")
+        
+    except ValueError:
+        print("Invalid input. Please enter a number.")
+    except Exception as exc:
+        print(f"Error: {exc}")
 
 def _position_to_market_dict(position: dict) -> dict:
     """
@@ -1730,6 +2088,213 @@ def positions_menu():
             except ValueError:
                 print("Invalid input. Please enter a number.\n")
 
+def orders_menu():
+    """
+    Submenu for viewing orders: Live, Delayed, Matched, Completed, or All.
+    Supports pagination with navigation options.
+    """
+    current_status = None
+    current_offset = 0
+    current_limit = DEFAULT_POSITIONS_LIMIT
+    pagination_info = None
+    exit_menu = False
+    
+    while True:
+        if exit_menu:
+            break
+        if current_status is None:
+            # Main menu
+            print("\nOrders Menu:")
+            print("  1) Live Orders")
+            print("  2) Delayed Orders")
+            print("  3) Matched Orders")
+            print("  4) Completed Orders")
+            print("  5) All Orders")
+            print("  6) Back to Trading Menu")
+            
+            choice = input("\nEnter choice: ").strip()
+            
+            if choice == "1":
+                current_status = "live"
+                current_offset = 0
+                status_name = "live"
+            elif choice == "2":
+                current_status = "delayed"
+                current_offset = 0
+                status_name = "delayed"
+            elif choice == "3":
+                current_status = "matched"
+                current_offset = 0
+                status_name = "matched"
+            elif choice == "4":
+                current_status = "completed"
+                current_offset = 0
+                status_name = "completed"
+            elif choice == "5":
+                current_status = None  # None means fetch all orders
+                current_offset = 0
+                status_name = "all"
+            elif choice == "6":
+                break
+            else:
+                print("Invalid choice. Please enter a number from 1 to 6.\n")
+                continue
+            
+            # Fetch and display orders
+            print(f"\nFetching {status_name} orders...")
+            orders_data = fetch_orders(status=current_status, limit=current_limit, offset=current_offset)
+            pagination_info, orders = _display_orders(orders_data)
+            
+            # For live and delayed orders, loop: prompt for selection, then show menu
+            if current_status in ("live", "delayed") and orders:
+                while True:
+                    _select_order_for_cancel(orders)
+                    # Show menu after cancel attempt
+                    print("\nOptions:")
+                    print("  1) Refresh Orders")
+                    print("  2) Back to Orders Menu")
+                    print("  3) Back to Trading Menu")
+                    choice = input("\nEnter choice (1/2/3 or Enter to refresh): ").strip()
+                    if choice == "2":
+                        current_status = None
+                        current_offset = 0
+                        pagination_info = None
+                        break  # Exit the while loop, go back to main menu
+                    elif choice == "3":
+                        exit_menu = True  # Signal to exit orders_menu entirely
+                        break  # Exit the while loop
+                    else:
+                        # Default: refresh orders and loop again to prompt for selection
+                        print(f"\nRefreshing {status_name} orders...")
+                        orders_data = fetch_orders(status=current_status, limit=current_limit, offset=current_offset)
+                        pagination_info, orders = _display_orders(orders_data)
+                        if not orders:
+                            # No orders left, go back to main menu
+                            current_status = None
+                            break
+                        # Loop will continue and prompt for selection again
+                # After breaking from live/delayed orders loop, continue outer loop
+                if current_status is None:
+                    continue
+        else:
+            # Pagination menu
+            print("\nNavigation:")
+            nav_options = []
+            nav_num = 1
+            
+            if pagination_info and pagination_info.get("has_more"):
+                nav_options.append(("next", "Next Page"))
+                print(f"  {nav_num}) Next Page")
+                nav_num += 1
+            
+            if current_offset > 0:
+                nav_options.append(("prev", "Previous Page"))
+                print(f"  {nav_num}) Previous Page")
+                nav_num += 1
+            
+            nav_options.append(("refresh", "Refresh Current Page"))
+            print(f"  {nav_num}) Refresh Current Page")
+            nav_num += 1
+            
+            nav_options.append(("back", "Back to Orders Menu"))
+            print(f"  {nav_num}) Back to Orders Menu")
+            nav_num += 1
+            
+            nav_options.append(("main", "Back to Trading Menu"))
+            print(f"  {nav_num}) Back to Trading Menu")
+            
+            choice = input("\nEnter choice: ").strip()
+            
+            try:
+                choice_num = int(choice)
+                if 1 <= choice_num <= len(nav_options):
+                    action, _ = nav_options[choice_num - 1]
+                    
+                    if action == "next":
+                        current_offset += current_limit
+                        print(f"\nFetching orders (offset {current_offset})...")
+                        orders_data = fetch_orders(status=current_status, limit=current_limit, offset=current_offset)
+                        pagination_info, orders = _display_orders(orders_data)
+                        # For live and delayed orders, immediately prompt for order selection
+                        if current_status in ("live", "delayed") and orders:
+                            _select_order_for_cancel(orders)
+                            # Show menu after cancel attempt
+                            print("\nOptions:")
+                            print("  1) Refresh Orders")
+                            print("  2) Back to Orders Menu")
+                            print("  3) Back to Trading Menu")
+                            choice = input("\nEnter choice (1/2/3 or Enter to refresh): ").strip()
+                            if choice == "2":
+                                current_status = None
+                                current_offset = 0
+                                pagination_info = None
+                                continue
+                            elif choice == "3":
+                                break
+                            else:
+                                # Default: refresh orders
+                                orders_data = fetch_orders(status=current_status, limit=current_limit, offset=current_offset)
+                                pagination_info, orders = _display_orders(orders_data)
+                    elif action == "prev":
+                        current_offset = max(0, current_offset - current_limit)
+                        print(f"\nFetching orders (offset {current_offset})...")
+                        orders_data = fetch_orders(status=current_status, limit=current_limit, offset=current_offset)
+                        pagination_info, orders = _display_orders(orders_data)
+                        # For live and delayed orders, immediately prompt for order selection
+                        if current_status in ("live", "delayed") and orders:
+                            _select_order_for_cancel(orders)
+                            # Show menu after cancel attempt
+                            print("\nOptions:")
+                            print("  1) Refresh Orders")
+                            print("  2) Back to Orders Menu")
+                            print("  3) Back to Trading Menu")
+                            choice = input("\nEnter choice (1/2/3 or Enter to refresh): ").strip()
+                            if choice == "2":
+                                current_status = None
+                                current_offset = 0
+                                pagination_info = None
+                                continue
+                            elif choice == "3":
+                                break
+                            else:
+                                # Default: refresh orders
+                                orders_data = fetch_orders(status=current_status, limit=current_limit, offset=current_offset)
+                                pagination_info, orders = _display_orders(orders_data)
+                    elif action == "refresh":
+                        print(f"\nRefreshing orders (offset {current_offset})...")
+                        orders_data = fetch_orders(status=current_status, limit=current_limit, offset=current_offset)
+                        pagination_info, orders = _display_orders(orders_data)
+                        # For live and delayed orders, immediately prompt for order selection
+                        if current_status in ("live", "delayed") and orders:
+                            _select_order_for_cancel(orders)
+                            # Show menu after cancel attempt
+                            print("\nOptions:")
+                            print("  1) Refresh Orders")
+                            print("  2) Back to Orders Menu")
+                            print("  3) Back to Trading Menu")
+                            choice = input("\nEnter choice (1/2/3 or Enter to refresh): ").strip()
+                            if choice == "2":
+                                current_status = None
+                                current_offset = 0
+                                pagination_info = None
+                                continue
+                            elif choice == "3":
+                                break
+                            else:
+                                # Default: refresh orders
+                                orders_data = fetch_orders(status=current_status, limit=current_limit, offset=current_offset)
+                                pagination_info, orders = _display_orders(orders_data)
+                    elif action == "back":
+                        current_status = None
+                        current_offset = 0
+                        pagination_info = None
+                    elif action == "main":
+                        break
+                else:
+                    print("Invalid choice. Please enter a number from the menu.\n")
+            except ValueError:
+                print("Invalid input. Please enter a number.\n")
+
 def start_trading_flow():
     """
     Submenu for trading: auto-creates session if needed, search markets, place orders.
@@ -1772,8 +2337,9 @@ def start_trading_flow():
         print("\nTrading Menu:")
         print("  1) Search and Trade Markets")
         print("  2) See Positions")
-        print("  3) Refresh Trading Session")
-        print("  4) Back to Main Menu")
+        print("  3) See Orders")
+        print("  4) Refresh Trading Session")
+        print("  5) Back to Main Menu")
         choice = input("\nEnter choice: ").strip()
 
         if choice == "1":
@@ -1781,6 +2347,8 @@ def start_trading_flow():
         elif choice == "2":
             positions_menu()
         elif choice == "3":
+            orders_menu()
+        elif choice == "4":
             try:
                 session = initiate_trading_session()
                 if session:
@@ -1790,10 +2358,10 @@ def start_trading_flow():
                     print("Trading session could not be refreshed.")
             except Exception as exc:
                 print(f"Failed to refresh trading session: {exc}")
-        elif choice == "4":
+        elif choice == "5":
             break
         else:
-            print("Invalid choice. Please enter a number from 1 to 4.\n")
+            print("Invalid choice. Please enter a number from 1 to 5.\n")
 
 def initiate_trading_session():
     """
@@ -1890,7 +2458,7 @@ def place_order(
     size: float,
     price: float,
     neg_risk: bool = False,
-    order_type: str = "FOK",
+    order_type: str = "GTC",
     chosen_outcome_name: str | None = None,
     chosen_token_id: str | None = None,
 ):
@@ -1905,7 +2473,7 @@ def place_order(
       - marketId: string (required)
       - tokenId: string (optional)
       - side: "BUY" | "SELL" (optional)
-      - orderType: "FOK" | "FAK" (optional; default "FOK"; "GTC" and "GTD" are not supported yet)
+      - orderType: "GTC" | "FOK" | "FAK" (optional; default "GTC")
       - price: float between 0.01 and 0.99 (optional)
       - size: float >= POLYMARKET_MIN_ORDER (optional)
       - signature: string (optional)
@@ -1968,7 +2536,10 @@ def place_order(
                 # For BUY: size is shares we want to receive
                 # Adjust price upward to ensure effective price >= orderbook price
                 # makerAmount: USDC we pay = shares * (price + PRICE_BUFFER_ADJUSTMENT)
-                adjusted_price = price + PRICE_BUFFER_ADJUSTMENT
+                if order_type in ("FOK", "FAK"):
+                    adjusted_price = price + PRICE_BUFFER_ADJUSTMENT
+                else:
+                    adjusted_price = price
                 usdc_amount = round_to_decimals(size * adjusted_price, 2)
                 maker_amount = int(round(usdc_amount * 1_000_000))
                 
@@ -1981,7 +2552,10 @@ def place_order(
                 maker_amount = to_6d_int(size)
                 
                 # takerAmount: USDC we receive = shares * (price - PRICE_BUFFER_ADJUSTMENT)
-                adjusted_price = max(0.01, price - PRICE_BUFFER_ADJUSTMENT)  # Ensure price doesn't go negative
+                if order_type in ("FOK", "FAK"):
+                    adjusted_price = max(0.01, price - PRICE_BUFFER_ADJUSTMENT)  # Ensure price doesn't go negative
+                else:
+                    adjusted_price = price
                 usdc_amount = round_to_decimals(size * adjusted_price, 2)
                 taker_amount = int(round(usdc_amount * 1_000_000))
 
