@@ -358,24 +358,35 @@ def build_epoch_history(
         for entity_id, trade in epoch_trades[epoch_idx]:
             col_idx = entity_map[entity_id]
             
-            volume = trade["volume"]
-            pnl = trade["pnl"]
+            expected_volume = trade["expected_volume"] if trade["expected_volume"] is not None else 0.0
+            volume = trade["volume"] if trade["volume"] is not None else 0.0
+            expected_fees = trade["expected_fees"] if trade["expected_fees"] is not None else 0.0
+            actual_fees = trade["actual_fees"] if trade["actual_fees"] is not None else 0.0
+            pnl = trade["pnl"] if trade["pnl"] is not None else 0.0
             is_correct = trade["is_correct"]
             is_reward_eligible = trade["is_reward_eligible"]
-            
-            # Calculate metrics
-            #fee = volume * VOLUME_FEE
-            fee = trade["actual_fees"] if trade["actual_fees"] is not None else 0.0
+
+            # Check expected and actual volume. If actual volume is more, the trader added to their position outside of Almanac. Mark the trade as unqualified.
+            # Give a $5 buffer for potential rounding issues.
+            if volume > expected_volume and abs(volume - expected_volume) > 5 and is_reward_eligible:
+                is_reward_eligible = False
+                print(f"Trader {entity_id} has more volume than expected ({volume} > {expected_volume}). Marking trade as not reward eligible.")
+
+            # Check expected and actual fees. If actual fees are less, the trader paid less fees than expected. Mark the trade as unqualified.
+            # Give a 10% buffer so we're not completely strict on the fees.
+            if actual_fees < expected_fees and (actual_fees / expected_fees) < 0.9 and is_reward_eligible:
+                is_reward_eligible = False
+                if actual_fees > 0:
+                    print(f"Trader {entity_id} has less fees than expected ({actual_fees} < {expected_fees}). Marking trade as not reward eligible.")
 
             # Always collect fees for all trades, even if the trade is not reward eligible
-            fees_prev[epoch_idx, col_idx] += fee
+            fees_prev[epoch_idx, col_idx] += actual_fees
             
-            if is_reward_eligible and fee > 0:
+            if is_reward_eligible and actual_fees > 0:
                 volume_prev[epoch_idx, col_idx] += volume
                 if is_correct:
                     # Winning trade: qualified volume (after fee deduction)
-                    #qualified = volume * (1.0 - VOLUME_FEE)
-                    qualified = volume - fee
+                    qualified = volume - actual_fees
                     qualified_prev[epoch_idx, col_idx] += qualified
                     correct_trade_counts[epoch_idx, col_idx] += 1
                 else:
@@ -384,6 +395,8 @@ def build_epoch_history(
                 
                 profit_prev[epoch_idx, col_idx] += pnl
                 trade_counts[epoch_idx, col_idx] += 1  # Count each trade
+
+    print()
     
     return {
         "volume_prev": volume_prev,
