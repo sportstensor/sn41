@@ -591,6 +591,8 @@ def main():
         miners_scores,
         general_pool_scores,
         current_epoch_budget,
+        miner_budget,
+        gp_budget,
         [],
         all_uids
     )
