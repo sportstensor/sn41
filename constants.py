@@ -33,15 +33,23 @@ MAX_EPOCH_BUDGET_PERCENTAGE_FOR_BOOST = .25
 # Set to 0 to disable.
 MINER_POOL_BUDGET_BOOST_PERCENTAGE = 0
 
-# Early stage incentive parameters
+# Early stage incentive parameters for the miner pool
 ENABLE_ES_MINER_INCENTIVES = True
 # This is the multiplier of the trader's fees paid that is given to the miner if they have positive tokens (score). 1.2 == 120%.
 ESM_MIN_MULTIPLIER = 1.2
-
 # If ENABLE_ES_MINER_LOSS_COMPENSATION is True, we will give back the trader's fees paid to the miner if they have positive epoch profit but no score.
 ENABLE_ES_MINER_LOSS_COMPENSATION = True
 # This is the percentage of the trader's fees paid that is given back to the miner if they have positive epoch profit but no score. 1.0 == 100%.
 ESM_LOSS_COMPENSATION_PERCENTAGE = 1.0
+
+# Early stage incentive parameters for the general pool
+ENABLE_ES_GP_INCENTIVES = True
+# This is the multiplier of the trader's fees paid that is given to the gp trader if they have positive tokens (score). 1.2 == 120%.
+ESGP_MIN_MULTIPLIER = 1.2
+# If ENABLE_ES_GP_LOSS_COMPENSATION is True, we will give back the trader's fees paid to the gp trader if they have positive epoch profit but no score.
+ENABLE_ES_GP_LOSS_COMPENSATION = False
+# This is the percentage of the trader's fees paid that is given back to the gp trader if they have positive epoch profit but no score. 1.0 == 100%.
+ESGP_LOSS_COMPENSATION_PERCENTAGE = 1.0
 
 # This is used to give more weights (and in turn, more incentives) to the miners by taking the final miner pool weights and boosting them by this percentage.
 # Set to 0 to disable.

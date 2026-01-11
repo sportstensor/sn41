@@ -464,7 +464,7 @@ class Validator:
                     
 
                     # Calculate the weights for the miners and general pool
-                    weights = calculate_weights(miners_scores, general_pool_scores, current_epoch_budget, miners_to_penalize, all_uids)
+                    weights = calculate_weights(miners_scores, general_pool_scores, current_epoch_budget, miner_budget, general_pool_budget, miners_to_penalize, all_uids)
                     self.scores = weights
                     
                     # Update the incentive mechanism weights on the Bittensor blockchain.

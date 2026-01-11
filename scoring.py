@@ -75,7 +75,11 @@ from constants import (
   ENABLE_ES_MINER_INCENTIVES,
   ESM_MIN_MULTIPLIER,
   ENABLE_ES_MINER_LOSS_COMPENSATION,
-  ESM_LOSS_COMPENSATION_PERCENTAGE
+  ESM_LOSS_COMPENSATION_PERCENTAGE,
+  ENABLE_ES_GP_INCENTIVES,
+  ESGP_MIN_MULTIPLIER,
+  ENABLE_ES_GP_LOSS_COMPENSATION,
+  ESGP_LOSS_COMPENSATION_PERCENTAGE
 )
 
 def score_miners(
@@ -229,6 +233,10 @@ def score_miners(
         require_epoch_preds=True,
         verbose=verbose
     )
+
+    # Check all positive general pool trader scores and apply early stage incentives
+    if ENABLE_ES_GP_INCENTIVES and len(general_pool_scores["scores"]) > 0:
+        general_pool_scores = apply_early_stage_gp_incentives(general_pool_history, general_pool_scores, general_pool_epoch_budget)
 
     return miner_history, general_pool_history, miners_scores, general_pool_scores, miner_pool_epoch_budget, general_pool_epoch_budget
 
@@ -1101,7 +1109,7 @@ def create_pool_stats_table(epoch_history, pool_type, include_current_epoch=Fals
                 if score_entity_id == entity_id:
                     earnings = scores['tokens'][i] if scores['tokens'][i] > 0 else 0
                     # If miner pool weight boost is enabled, apply the boost to the earnings
-                    if MINER_POOL_WEIGHT_BOOST_PERCENTAGE > 0:
+                    if pool_type == "Miner" and MINER_POOL_WEIGHT_BOOST_PERCENTAGE > 0:
                         earnings = earnings * (1 + MINER_POOL_WEIGHT_BOOST_PERCENTAGE)
                     break
 
@@ -1229,7 +1237,73 @@ def apply_early_stage_miner_incentives(miner_history: Dict[str, Any], miners_sco
 
     return miners_scores
 
-def calculate_weights(miners_scores: Dict[str, Any], general_pool_scores: Dict[str, Any], current_epoch_budget: float, miners_to_penalize: List[int], all_uids: List[int]) -> List[float]:
+def apply_early_stage_gp_incentives(general_pool_history: Dict[str, Any], general_pool_scores: Dict[str, Any], general_pool_epoch_budget: float) -> Dict[str, Any]:
+    """
+    Apply early stage general pool incentives to ensure gp traders with positive scores
+    receive at least ESGP_MIN_MULTIPLIER * their fees paid.
+    
+    Also gives fees back to gp traders with positive profit but no score (if ENABLE_ES_GP_LOSS_COMPENSATION is True and eligible).
+    
+    Modifies tokens directly (not scores) since tokens are the actual rewards.
+    If total general pool tokens exceed general pool epoch budget, scales down proportionally.
+    """
+    if general_pool_epoch_budget == 0:
+        print(f"General pool epoch budget is 0, no early stage incentives will be applied.")
+        return general_pool_scores
+    
+    n_epochs = general_pool_history["n_epochs"]
+    n_entities = general_pool_history["n_entities"]
+    
+    if n_entities == 0 or n_epochs == 0:
+        return general_pool_scores
+    
+    fees_prev_matrix = general_pool_history["fees_prev"]
+    profit_prev_matrix = general_pool_history["profit_prev"]
+    trade_counts = general_pool_history["trade_counts"]
+    current_epoch_idx = n_epochs - 1
+    current_epoch_fees = fees_prev_matrix[current_epoch_idx]
+    current_epoch_profit = profit_prev_matrix[current_epoch_idx]
+
+    # Boost TOKENS for gp traders based on their performance
+    for entity_idx in range(n_entities):
+        entity_epochs_with_trades = np.sum(trade_counts[:, entity_idx] > 0)
+        
+        # If gp trader has positive tokens (score), give them a minimum of 1.2x their fees
+        if general_pool_scores["tokens"][entity_idx] > 0:
+            original_tokens = general_pool_scores["tokens"][entity_idx]
+            general_pool_scores["tokens"][entity_idx] = max(
+                general_pool_scores["tokens"][entity_idx], 
+                current_epoch_fees[entity_idx] * ESGP_MIN_MULTIPLIER
+            )
+            new_tokens = general_pool_scores["tokens"][entity_idx]
+            if new_tokens > original_tokens:
+                print(f"Giving performant gp trader {entity_idx} reward boost: from {original_tokens:,.2f} -> {new_tokens:,.2f}")
+        # If gp trader has positive profit for this epoch, but no score, give them their fees back
+        elif ENABLE_ES_GP_LOSS_COMPENSATION and current_epoch_profit[entity_idx] > 0 and entity_epochs_with_trades >= MIN_EPOCHS_FOR_ELIGIBILITY:
+            original_tokens = general_pool_scores["tokens"][entity_idx]
+            general_pool_scores["tokens"][entity_idx] = current_epoch_fees[entity_idx] * ESGP_LOSS_COMPENSATION_PERCENTAGE
+            new_tokens = general_pool_scores["tokens"][entity_idx]
+            print(f"Giving loss-compensating gp trader {entity_idx} fees back: {new_tokens:,.2f}")
+
+    # Check if total tokens exceed budget
+    total_tokens = np.sum(general_pool_scores["tokens"])
+    if total_tokens > general_pool_epoch_budget:
+        print(f"Early stage general pool incentives: Total tokens {total_tokens:,.2f} exceeds budget {general_pool_epoch_budget:,.2f}. Scaling down proportionally.")
+        # Scale down proportionally to fit budget
+        scale_factor = general_pool_epoch_budget / total_tokens
+        general_pool_scores["tokens"] = general_pool_scores["tokens"] * scale_factor
+
+    return general_pool_scores
+
+def calculate_weights(
+        miners_scores: Dict[str, Any], 
+        general_pool_scores: Dict[str, Any], 
+        current_epoch_budget: float, 
+        miner_budget: float, 
+        general_pool_budget: float, 
+        miners_to_penalize: List[int], 
+        all_uids: List[int]
+    ) -> List[float]:
     """
     Calculate the weights for the miners and general pool based on the scores and the current epoch budget.
     """
@@ -1267,10 +1341,16 @@ def calculate_weights(miners_scores: Dict[str, Any], general_pool_scores: Dict[s
         #print(f"Miner {miner_uid} tokens allocated: {miner_tokens:,.2f}, weight: {miner_weight:.4f}")
         miner_weights[miner_uid] = miner_weight
     
+    # Print the total miner pool fees collected this epoch
+    print(f"Miner pool fees: {miner_budget:,.2f}")
+
     # Calculate total miner pool tokens (excluding penalized miners)
     total_miner_pool_tokens = sum(miner_tokens_allocated[i] for i, uid in enumerate(miner_entity_ids) if uid not in miners_to_penalize)
     #bt.logging.info(f"Miner pool total epoch units: {total_miner_pool_tokens:,.2f}")
     print(f"Miner pool total epoch units: {total_miner_pool_tokens:,.2f}")
+
+    # Print the total general pool fees collected this epoch
+    print(f"General pool fees: {general_pool_budget:,.2f}")
 
     # Step 2: Calculate general pool total weight and assign to BURN_UID.
     total_general_pool_tokens = np.sum(general_pool_tokens_allocated)
