@@ -612,7 +612,11 @@ def log_scores_to_database(miner_history, general_pool_history, miners_scores, g
                 "payout": round(float(miner_tokens[i]) if i < len(miner_tokens) else 0.0, 2),
                 "subnet_weight": round(float(subnet_weight), 6)
             }
-            storage.insert_epoch_trader_scores(trader_data)
+            if account_id is not None:
+                storage.insert_epoch_trader_scores(trader_data)
+            else:
+                bt.logging.warning(f"No account ID found for miner trader: {trader_data}")
+                continue
         
         # Insert trader-level data for general pools
         gp_entity_ids = general_pool_scores.get('entity_ids', [])
@@ -652,7 +656,11 @@ def log_scores_to_database(miner_history, general_pool_history, miners_scores, g
                 "payout": round(float(gp_tokens[i]) if i < len(gp_tokens) else 0.0, 2),
                 "subnet_weight": 0.0 # always 0 for general pool
             }
-            storage.insert_epoch_trader_scores(trader_data)
+            if account_id is not None:
+                storage.insert_epoch_trader_scores(trader_data)
+            else:
+                bt.logging.warning(f"No account ID found for general pool trader: {trader_data}")
+                continue
         
         bt.logging.info(f"Successfully logged scores to database for epoch {epoch_date}")
         
