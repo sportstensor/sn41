@@ -1316,6 +1316,12 @@ def calculate_weights(
     
     # Calculate total subnet budget for normalization
     total_epoch_budget = current_epoch_budget
+    
+    # Guard against division by zero - if budget is zero or negative, return zero weights
+    if total_epoch_budget <= 0:
+        bt.logging.error(f"Total epoch budget is zero or negative ({total_epoch_budget}), cannot calculate weights. Returning zero weights.")
+        return [0.0] * len(all_uids)
+    
     #bt.logging.info(f"Total epoch budget: {total_epoch_budget:,.2f}")
     print(f"Total epoch budget: {total_epoch_budget:,.2f}")
     
