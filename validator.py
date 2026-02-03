@@ -368,8 +368,8 @@ class Validator:
             # Get the current block number and the last update time.
             try:
                 should_score_and_set_weights = False
-                # Score and set weights every hour on the hour
-                if minutes == 0:
+                # Score and set weights every hour on the 10th minute of the hour
+                if minutes == 10:
                     should_score_and_set_weights = True
 
                 # If metadata manager last full sync is more than 2 hours ago, skip scoring and setting weights
