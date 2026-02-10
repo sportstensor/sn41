@@ -292,7 +292,7 @@ class Validator:
                     response = requests.get(
                         url, 
                         auth=HTTPBasicAuth(hotkey, signature),
-                        timeout=10
+                        timeout=15
                     )
                     response.raise_for_status()
                     api_response = response.json()
