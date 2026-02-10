@@ -16,8 +16,8 @@ KAPPA_NEXT = 0.03 # originally 0.02
 KAPPA_SCALING_FACTOR = 1 # originally 6
 
 # Build-up period constants for miner eligibility
-MIN_EPOCHS_FOR_ELIGIBILITY = 2  # Must trade for X epochs
-MIN_PREDICTIONS_FOR_ELIGIBILITY = 2  # Must have X predictions
+MIN_EPOCHS_FOR_ELIGIBILITY = 0  # Must trade for X epochs
+MIN_PREDICTIONS_FOR_ELIGIBILITY = 1  # Must have X predictions
 
 # Weighting parameters
 # If ENABLE_STATIC_WEIGHTING is True, we will use the static weighting parameters below.
