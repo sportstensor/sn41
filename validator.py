@@ -29,6 +29,7 @@ class Validator:
         self.setup_logging()
         self.setup_bittensor_objects()
         self.last_update = 0
+        self.scoring_minute = random.randint(5, 15)  # Run once per hour at this minute (UTC)
         self.current_block = 0
         self.node = SubstrateInterface(url=self.config.subtensor.chain_endpoint)
         self.tempo = self.node_query('SubtensorModule', 'Tempo', [self.config.netuid])
@@ -362,6 +363,7 @@ class Validator:
     def run(self):
         # The Main Validation Loop.
         bt.logging.info("=========== STARTING SN41 VALIDATOR LOOP ===========")
+        bt.logging.info(f"Scoring/set_weights will run once per hour at minute {self.scoring_minute} (UTC)")
         while True:
             current_time = datetime.datetime.now(datetime.timezone.utc)
             minutes = current_time.minute
@@ -369,8 +371,8 @@ class Validator:
             # Get the current block number and the last update time.
             try:
                 should_score_and_set_weights = False
-                # Score and set weights every hour between the 5th and 15th minute of the hour
-                if minutes == random.randint(5, 15):
+                # Score and set weights once per hour at our randomly chosen minute (5–15, set at startup)
+                if minutes == self.scoring_minute:
                     should_score_and_set_weights = True
 
                 # If metadata manager last full sync is more than 2 hours ago, skip scoring and setting weights
