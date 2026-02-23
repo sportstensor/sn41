@@ -12,6 +12,7 @@ from requests.auth import HTTPBasicAuth
 from subprocess import Popen, PIPE
 from substrateinterface import SubstrateInterface
 import numpy as np
+import random
 
 from metadata_manager import MetadataManager
 from scoring import score_miners, calculate_weights, print_pool_stats
@@ -368,8 +369,8 @@ class Validator:
             # Get the current block number and the last update time.
             try:
                 should_score_and_set_weights = False
-                # Score and set weights every hour on the 10th minute of the hour
-                if minutes == 10:
+                # Score and set weights every hour between the 5th and 15th minute of the hour
+                if minutes == random.randint(5, 15):
                     should_score_and_set_weights = True
 
                 # If metadata manager last full sync is more than 2 hours ago, skip scoring and setting weights
