@@ -7,6 +7,8 @@ It allows you to:
 - Generate Polymarket API credentials
 - Initiate trading sessions and place orders
 - Fetch positions summary
+- Check and claim Polymarket proceeds (Almanac redeem + Polymarket relayer; batch losing cleanup)
+- Funds: proxy wallet balance (API), deposit to proxy (USDC.e or Polymarket bridge native USDC/POL), withdraw via relayer
 - Link/unlink Bittensor UID to Almanac account
 - Manage multiple credential sets (wallet accounts)
 
@@ -14,6 +16,8 @@ Credential Sets:
 Supports multiple wallet accounts via prefixed environment variables (e.g., WALLET1_EOA_WALLET_ADDRESS).
 Each set can have its own wallet address, private key, proxy funder, and Polymarket API credentials.
 Switch between sets at runtime - sessions are automatically cleared when switching accounts.
+
+Polygon JSON-RPC defaults to https://polygon.drpc.org (Polygon docs mainnet endpoint); set POLYGON_RPC_URL in api_trading.env to override.
 
 Requirements:
 - Python 3.10+
@@ -28,8 +32,11 @@ Python dependencies:
 - py-clob-client
 - eth-account
 - bittensor
+- web3
+- py-builder-relayer-client
+- py-builder-signing-sdk
 
-pip install requests dotenv py-clob-client eth-account bittensor tabulate
+pip install -r requirements-trading.txt
 """
 
 import os
@@ -47,11 +54,69 @@ import bittensor as bt
 from datetime import datetime
 from tabulate import tabulate
 from constants import VOLUME_FEE, PRICE_BUFFER_ADJUSTMENT
+from web3 import Web3
+from requests.compat import json as requests_json
+from py_builder_relayer_client.client import RelayClient
+from py_builder_relayer_client.models import OperationType, SafeTransaction
+from py_builder_relayer_client.exceptions import RelayerClientException
+from py_builder_signing_sdk.sdk_types import BuilderHeaderPayload
 
 ALMANAC_API_URL = "https://api.almanac.market/api"
 #ALMANAC_API_URL = "http://localhost:3001/api"
 POLYMARKET_CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
+
+# Polymarket data-api: redeemable positions (aligned with Almanac ClaimProceedsModal)
+POLY_POSITIONS_WINNERS_URL = (
+    "https://data-api.polymarket.com/positions"
+    "?user={proxy_lc}&sizeThreshold=.1&redeemable=true&limit=100&offset=0&sortBy=CASHPNL"
+)
+POLY_POSITIONS_MIXED_URL = (
+    "https://data-api.polymarket.com/positions"
+    "?user={proxy_lc}&sizeThreshold=.1&redeemable=true&limit=50"
+)
+MAX_TOTAL_REDEMPTIONS = 20
+MAX_LOSING_POSITIONS_TO_CLOSE = 15
+VALUE_WINNER_MIN = 0.01
+VALUE_LOSER_MAX = 0.01
+SIZE_MIN_TOKENS = 0.1
+
+# Polygon USDC.e (bridged) — Polymarket trading balance on proxy/Safe
+USDC_E_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+NATIVE_USDC_POLYGON = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+POLYMARKET_BRIDGE_DEPOSIT_URL = "https://bridge.polymarket.com/deposit"
+POLYMARKET_RELAYER_URL = "https://relayer-v2.polymarket.com"
+# https://docs.polygon.technology/pos/reference/rpc-endpoints/ (mainnet table + public RPCs)
+DEFAULT_POLYGON_RPC_URL = "https://polygon.drpc.org"
+USDC_E_DECIMALS = 6
+
+ERC20_MIN_ABI = [
+    {
+        "type": "function",
+        "name": "balanceOf",
+        "stateMutability": "view",
+        "inputs": [{"name": "account", "type": "address"}],
+        "outputs": [{"type": "uint256"}],
+    },
+    {
+        "type": "function",
+        "name": "transfer",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "to", "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "outputs": [{"type": "bool"}],
+    },
+    {
+        "type": "function",
+        "name": "decimals",
+        "stateMutability": "view",
+        "inputs": [],
+        "outputs": [{"type": "uint8"}],
+    },
+]
+
 # EIP-712 domain contract for Polymarket CTF Exchange
 EIP712_DOMAIN_CONTRACT = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 EIP712_DOMAIN_NEGRISK_CONTRACT = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
@@ -1177,6 +1242,1139 @@ def cancel_order(order_id: str):
     except Exception as exc:
         print(f"Error cancelling order: {exc}")
         return None
+
+
+def _redeemable_row_current_value(p: dict) -> float:
+    v = p.get("currentValue")
+    try:
+        return float(v) if v is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _claim_plan_position_name(p: dict) -> str:
+    """Human-readable line for Polymarket data-api position (claim proceeds UI)."""
+    t = (p.get("title") or p.get("question") or "").strip()
+    if t:
+        return _truncate_text(t, 52)
+    cid = str(p.get("conditionId") or "")
+    return _truncate_text(cid, 18) if cid else "—"
+
+
+def _claim_plan_roi_percent_str(p: dict, bet: float, won: float) -> str:
+    """ROI for display; prefer API percentPnl, else derive from initial vs current."""
+    pct = None
+    raw = p.get("percentPnl")
+    if raw is not None:
+        try:
+            pct = float(raw)
+        except (TypeError, ValueError):
+            pct = None
+    if pct is None and bet > 0:
+        pct = ((won - bet) / bet) * 100.0
+    elif pct is None:
+        pct = 0.0
+    return f"{pct:+.0f}%"
+
+
+def _redeemable_row_is_valid(p: dict) -> bool:
+    return bool(p.get("conditionId")) and p.get("outcomeIndex") is not None
+
+
+def _polymarket_get_positions_list(url: str) -> list:
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else []
+    except Exception as exc:
+        print(f"Polymarket data-api error: {exc}")
+        return []
+
+
+def aggregate_claimable_bets(bets: list, include_losing_positions: bool) -> list:
+    """
+    Group by conditionId. Per group:
+      indexSets = sorted unique of (outcomeIndex + 1) for each bet in group
+      negativeRisk = any bet.negativeRisk
+      if negativeRisk: yesAmount/noAmount = floor(sum(size per outcome 0/1) * 1e6) as strings
+    If include_losing_positions is False: drop rows with currentValue <= VALUE_WINNER_MIN.
+    """
+    filtered = []
+    for bet in bets:
+        if not _redeemable_row_is_valid(bet):
+            continue
+        if not include_losing_positions and _redeemable_row_current_value(bet) <= VALUE_WINNER_MIN:
+            continue
+        filtered.append(bet)
+
+    by_condition: dict[str, list] = {}
+    for bet in filtered:
+        cid = bet["conditionId"]
+        by_condition.setdefault(cid, []).append(bet)
+
+    redemptions = []
+    for condition_id, group in by_condition.items():
+        index_sets = sorted({int(b["outcomeIndex"]) + 1 for b in group})
+        neg = any(b.get("negativeRisk") for b in group)
+        item = {"conditionId": condition_id, "indexSets": index_sets, "negativeRisk": neg}
+        if neg:
+            yes_size = sum(
+                float(b.get("size") or 0)
+                for b in group
+                if int(b.get("outcomeIndex") or 0) == 0
+            )
+            no_size = sum(
+                float(b.get("size") or 0)
+                for b in group
+                if int(b.get("outcomeIndex") or 0) == 1
+            )
+            item["yesAmount"] = str(int(yes_size * 1_000_000))
+            item["noAmount"] = str(int(no_size * 1_000_000))
+        redemptions.append(item)
+    return redemptions
+
+
+def build_polymarket_claim_plan(proxy_lc: str) -> dict:
+    """
+    Fetch redeemable positions from Polymarket, apply winner gate and losing cleanup slots.
+    Returns dict with has_winnings_to_claim, totals, redemptions payload fields, and slices for UI.
+    """
+    winners_raw = _polymarket_get_positions_list(
+        POLY_POSITIONS_WINNERS_URL.format(proxy_lc=proxy_lc)
+    )
+    winners = [
+        p
+        for p in winners_raw
+        if _redeemable_row_is_valid(p) and _redeemable_row_current_value(p) > VALUE_WINNER_MIN
+    ]
+    if not winners:
+        return {
+            "has_winnings_to_claim": False,
+            "total_proceeds_usd": 0.0,
+            "winning_position_count": 0,
+            "losing_cleanup_included": 0,
+            "redemption_operation_count": 0,
+            "redemptions": [],
+            "winners": [],
+            "losing_slice": [],
+            "redemptions_truncated": False,
+        }
+
+    total_proceeds_usd = sum(max(0.0, _redeemable_row_current_value(p)) for p in winners)
+    winning_redemptions = aggregate_claimable_bets(winners, include_losing_positions=False)
+    num_winning_conditions = len(winning_redemptions)
+    slots_for_losing = max(
+        0, min(MAX_LOSING_POSITIONS_TO_CLOSE, MAX_TOTAL_REDEMPTIONS - num_winning_conditions)
+    )
+
+    losing_slice = []
+    if slots_for_losing > 0:
+        try:
+            mixed = _polymarket_get_positions_list(
+                POLY_POSITIONS_MIXED_URL.format(proxy_lc=proxy_lc)
+            )
+            for p in mixed:
+                if not _redeemable_row_is_valid(p):
+                    continue
+                try:
+                    sz = float(p.get("size") or 0)
+                except (TypeError, ValueError):
+                    continue
+                cv = _redeemable_row_current_value(p)
+                if sz > SIZE_MIN_TOKENS and cv < VALUE_LOSER_MAX:
+                    losing_slice.append(p)
+            losing_slice = losing_slice[:slots_for_losing]
+        except Exception:
+            losing_slice = []
+
+    all_positions = winners + losing_slice
+    redemptions = aggregate_claimable_bets(all_positions, include_losing_positions=True)
+    truncated = False
+    if len(redemptions) > MAX_TOTAL_REDEMPTIONS:
+        redemptions = redemptions[:MAX_TOTAL_REDEMPTIONS]
+        truncated = True
+
+    return {
+        "has_winnings_to_claim": True,
+        "total_proceeds_usd": total_proceeds_usd,
+        "winning_position_count": len(winners),
+        "losing_cleanup_included": len(losing_slice),
+        "redemption_operation_count": len(redemptions),
+        "redemptions": redemptions,
+        "winners": winners,
+        "losing_slice": losing_slice,
+        "redemptions_truncated": truncated,
+    }
+
+
+def _post_almanac_redeem_prepare(redemptions: list) -> tuple[bool, str | None, dict | None]:
+    """
+    POST /v1/redeem. Almanac returns success with calldata; it does not broadcast on-chain.
+    Returns (ok, error_message, json_payload).
+    """
+    global CURRENT_SESSION
+    if not CURRENT_SESSION:
+        return False, "No active trading session.", None
+    data = CURRENT_SESSION.get("data") or {}
+    session_id = data.get("sessionId")
+    eoa = data.get("walletAddress") or _get_credential("EOA_WALLET_ADDRESS")
+    proxy = data.get("proxyWallet") or _get_credential("EOA_PROXY_FUNDER")
+    if not session_id or not eoa or not proxy:
+        return False, "Missing sessionId, wallet, or proxy wallet.", None
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-session-id": session_id,
+        "x-wallet-address": str(eoa).lower(),
+    }
+    body = {
+        "redemptions": [
+            {
+                "conditionId": r["conditionId"],
+                "indexSets": r["indexSets"],
+                "negativeRisk": r["negativeRisk"],
+                **(
+                    {"yesAmount": r["yesAmount"], "noAmount": r["noAmount"]}
+                    if r.get("negativeRisk")
+                    else {}
+                ),
+            }
+            for r in redemptions
+        ],
+        "userWalletAddress": eoa,
+        "proxyWallet": proxy,
+        "sessionId": session_id,
+    }
+    try:
+        response = requests.post(
+            f"{ALMANAC_API_URL}/v1/redeem",
+            headers=headers,
+            json=body,
+            timeout=60,
+        )
+        if response.status_code != 200:
+            try:
+                return False, json.dumps(response.json(), indent=2), None
+            except Exception:
+                return False, response.text or "", None
+
+        raw = (response.text or "").strip()
+        if not raw:
+            return False, "Empty response body from redeem API (HTTP 200).", None
+        try:
+            payload = response.json()
+        except Exception:
+            return (
+                False,
+                f"Redeem returned non-JSON (HTTP 200): {raw[:800]}",
+                None,
+            )
+
+        if not isinstance(payload, dict):
+            return False, f"Unexpected redeem JSON type: {type(payload).__name__}", None
+
+        if not bool(payload.get("success")):
+            return False, json.dumps(payload, indent=2), None
+
+        return True, None, payload
+    except Exception as exc:
+        return False, str(exc), None
+
+
+def _relay_submit_redeem_transactions(txs_raw: list) -> tuple[bool, str | None]:
+    """Submit redeem calldata from Almanac through Polymarket relayer (same path as withdraw)."""
+    client = _make_relay_client()
+    if not client:
+        return False, "Could not create relayer client (EOA_WALLET_PK or builder-sign)."
+    relay_txs: list[SafeTransaction] = []
+    for t in txs_raw:
+        if not isinstance(t, dict):
+            return False, f"Invalid transaction entry in redeem response: {t!r}"
+        to_addr = t.get("to")
+        data = t.get("data")
+        if not to_addr or not data:
+            return False, f"Redeem tx missing to/data: {t!r}"
+        try:
+            to_chk = Web3.to_checksum_address(to_addr)
+        except Exception as exc:
+            return False, f"Invalid redeem tx `to` {to_addr!r}: {exc}"
+        ds = str(data)
+        if not ds.startswith("0x"):
+            ds = "0x" + ds
+        try:
+            op_int = int(t.get("operation", 0))
+        except (TypeError, ValueError):
+            op_int = 0
+        op_type = (
+            OperationType.DelegateCall if op_int == 1 else OperationType.Call
+        )
+        relay_txs.append(
+            SafeTransaction(
+                to=to_chk,
+                operation=op_type,
+                data=ds,
+                value=str(t.get("value", "0")),
+            )
+        )
+    try:
+        print("\nSubmitting redemption transaction(s)...")
+        resp = client.execute(relay_txs, "Redeem Polymarket proceeds")
+        result = resp.wait()
+        if result is not None:
+            if isinstance(result, dict):
+                th = result.get("transactionHash") or result.get("transaction_hash")
+                if th:
+                    print(f"Polygon transaction hash: {th}")
+            return True, None
+        return False, "Relayer did not confirm the transaction (timeout or on-chain failure)."
+    except RelayerClientException as exc:
+        msg = str(exc)
+        if getattr(exc, "status_code", None) == 401:
+            msg += (
+                " Try: Trading menu → Refresh Trading Session. "
+                "Builder headers must be accepted by the Polymarket relayer."
+            )
+        return False, msg
+    except Exception as exc:
+        return False, str(exc)
+
+
+def request_redeem_transactions(redemptions: list) -> tuple[bool, str | None]:
+    """
+    Prepare redemptions via Almanac POST /v1/redeem, then execute returned calldata
+    through the Polymarket relayer (EOA-signed Safe txs). Returns (True, None) only after
+    relayer success; Almanac alone only returns prepared transactions, not mined redeems.
+    """
+    ok, err, payload = _post_almanac_redeem_prepare(redemptions)
+    if not ok or not payload:
+        return False, err
+
+    txs_raw = payload.get("transactions")
+    if isinstance(txs_raw, list) and len(txs_raw) > 0:
+        return _relay_submit_redeem_transactions(txs_raw)
+
+    api_msg = payload.get("message") or ""
+    return (
+        False,
+        "Almanac returned success but no `transactions` to execute on-chain.\n"
+        f"API message: {api_msg!r}\n"
+        f"{json.dumps(payload, indent=2)}",
+    )
+
+
+def claim_proceeds_menu():
+    """
+    On entry: fetch claimable proceeds from Polymarket data-api; POST Almanac /v1/redeem then
+    execute returned txs via Polymarket relayer (EOA-signed Safe).
+    """
+    global CURRENT_SESSION
+    if not CURRENT_SESSION:
+        print("No active trading session. Create a session first.")
+        return
+
+    proxy = (CURRENT_SESSION.get("data") or {}).get("proxyWallet") or _get_credential(
+        "EOA_PROXY_FUNDER"
+    )
+    if not proxy:
+        print("No proxy wallet on session or EOA_PROXY_FUNDER; cannot resolve Polymarket positions user.")
+        return
+
+    proxy_lc = proxy.lower()
+
+    print("\nChecking for claimable proceeds...")
+    plan = build_polymarket_claim_plan(proxy_lc)
+
+    if not plan["has_winnings_to_claim"]:
+        print("No claimable proceeds right now.")
+        input("\nPress Enter to continue...")
+        return
+
+    print(f"\nAmount available to claim: ${plan['total_proceeds_usd']:.2f}")
+
+    if plan.get("redemptions_truncated"):
+        print(
+            f"Note: at most {MAX_TOTAL_REDEMPTIONS} markets can be included in one request."
+        )
+
+    rows = []
+    for p in plan["winners"]:
+        name = _claim_plan_position_name(p)
+        try:
+            bet = (
+                float(p["initialValue"])
+                if p.get("initialValue") is not None
+                else 0.0
+            )
+        except (TypeError, ValueError):
+            bet = 0.0
+        won = max(0.0, _redeemable_row_current_value(p))
+        roi = _claim_plan_roi_percent_str(p, bet, won)
+        rows.append(
+            [
+                name,
+                f"${bet:.2f}",
+                f"${won:.2f}",
+                roi,
+            ]
+        )
+    if rows:
+        print("\nPositions:")
+        print(
+            tabulate(
+                rows,
+                headers=["Position", "Amount bet", "Amount won", "ROI%"],
+                tablefmt="grid",
+            )
+        )
+
+    confirm = input("\nRequest claim transactions from Almanac? [y/N]: ").strip().lower()
+    if confirm != "y":
+        print("Cancelled.")
+        input("\nPress Enter to continue...")
+        return
+
+    ok, err = request_redeem_transactions(plan["redemptions"])
+    if ok:
+        print("\nClaim succeeded (relayer confirmed on-chain).")
+    else:
+        print("\nClaim failed.")
+        if err:
+            print(err)
+    input("\nPress Enter to continue...")
+
+
+def _inject_polygon_poa_middleware(w3: Web3) -> None:
+    try:
+        from web3.middleware import ExtraDataToPOAMiddleware
+
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    except Exception:
+        try:
+            from web3.middleware import geth_poa_middleware
+
+            w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+        except Exception:
+            pass
+
+
+def _polygon_rpc_url() -> str:
+    load_dotenv(dotenv_path=str(ENV_PATH), override=True)
+    u = os.environ.get("POLYGON_RPC_URL", "").strip()
+    return u or DEFAULT_POLYGON_RPC_URL
+
+
+def get_polygon_web3() -> Web3 | None:
+    rpc = _polygon_rpc_url()
+    w3 = Web3(Web3.HTTPProvider(rpc))
+    if not w3.is_connected():
+        return None
+    _inject_polygon_poa_middleware(w3)
+    return w3
+
+
+POLYGON_GAS_PRICE_BUMP = 1.2
+
+
+def _polygon_bumped_legacy_gas_price_wei(w3: Web3, bump_ratio: float = POLYGON_GAS_PRICE_BUMP) -> int:
+    """
+    Legacy gasPrice above eth_gasPrice so txs are less likely to sit in mempool
+    when fees move up right after broadcast.
+    """
+    base = int(w3.eth.gas_price)
+    bumped = int(base * bump_ratio)
+    return bumped if bumped > base else base + 1
+
+
+def _encode_erc20_transfer(w3: Web3, token: str, to_addr: str, amount_wei: int) -> str:
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(token), abi=ERC20_MIN_ABI
+    )
+    data = contract.encode_abi(
+        abi_element_identifier="transfer",
+        args=[Web3.to_checksum_address(to_addr), amount_wei],
+    )
+    if isinstance(data, bytes):
+        return "0x" + data.hex()
+    s = str(data)
+    return s if s.startswith("0x") else "0x" + s
+
+
+def fetch_auth_balances_raw() -> dict | None:
+    """GET /v1/auth/balances/{eoa} with session headers. Returns parsed JSON dict or None."""
+    global CURRENT_SESSION
+    if not CURRENT_SESSION:
+        print("No active trading session. Create a session first.")
+        return None
+    data = CURRENT_SESSION.get("data") or {}
+    session_id = data.get("sessionId")
+    eoa = data.get("walletAddress") or _get_credential("EOA_WALLET_ADDRESS")
+    if not session_id or not eoa:
+        print("Missing session or wallet address.")
+        return None
+    headers = {
+        "Content-Type": "application/json",
+        "x-session-id": session_id,
+        "x-wallet-address": str(eoa).lower(),
+    }
+    try:
+        r = requests.get(
+            f"{ALMANAC_API_URL}/v1/auth/balances/{eoa}",
+            headers=headers,
+            timeout=30,
+        )
+        if r.status_code != 200:
+            try:
+                print(json.dumps(r.json(), indent=2))
+            except Exception:
+                print(r.text or f"HTTP {r.status_code}")
+            return None
+        return r.json()
+    except Exception as exc:
+        print(f"Error fetching balances: {exc}")
+        return None
+
+
+def _extract_proxy_usdc_formatted(payload: dict) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    root = payload.get("data")
+    if root is None:
+        root = payload
+    if not isinstance(root, dict):
+        return None
+    proxy = root.get("proxy")
+    if not isinstance(proxy, dict):
+        return None
+    bal = proxy.get("balance")
+    if isinstance(bal, dict):
+        f = bal.get("formatted")
+        if f is not None:
+            return str(f)
+        amt = bal.get("amount")
+        if amt is not None:
+            return str(amt)
+    if isinstance(bal, str):
+        return bal
+    return None
+
+
+def funds_show_balance() -> None:
+    raw = fetch_auth_balances_raw()
+    if raw is None:
+        return
+    formatted = _extract_proxy_usdc_formatted(raw)
+    print("\nSafe/Proxy wallet balance")
+    if formatted is not None:
+        print(f"  USDC.e: {formatted}")
+    else:
+        print("  Could not read balance from API. Response keys:")
+        print(json.dumps(list(raw.keys()) if isinstance(raw, dict) else raw, indent=2))
+    input("\nPress Enter to continue...")
+
+
+def _print_eoa_balances_for_deposit(w3: Web3, eoa: str) -> None:
+    """USDC.e, native USDC, and POL on the EOA on Polygon (chain 137)."""
+    try:
+        cs = Web3.to_checksum_address(eoa)
+        usdc_e = w3.eth.contract(
+            address=Web3.to_checksum_address(USDC_E_POLYGON), abi=ERC20_MIN_ABI
+        )
+        native_u = w3.eth.contract(
+            address=Web3.to_checksum_address(NATIVE_USDC_POLYGON), abi=ERC20_MIN_ABI
+        )
+        e_wei = usdc_e.functions.balanceOf(cs).call()
+        n_wei = native_u.functions.balanceOf(cs).call()
+        pol_wei = w3.eth.get_balance(cs)
+        print(f"\nYour Polygon EVM wallet ({eoa})")
+        print(f"  USDC.e:      {e_wei / 10**USDC_E_DECIMALS:.6f}")
+        print(f"  Native USDC: {n_wei / 10**USDC_E_DECIMALS:.6f}")
+        print(f"  POL (gas):   {pol_wei / 10**18:.6f}")
+    except Exception as exc:
+        print(f"\nCould not load EOA balances: {exc}")
+
+
+def _transfer_usdc_e_eoa_to_proxy(w3: Web3, safe: str, account: Account) -> None:
+    eoa = account.address
+    amt_s = input("\nUSDC.e amount to send to proxy (human units, e.g. 10.5): ").strip()
+    try:
+        amt_human = float(amt_s)
+    except ValueError:
+        print("Invalid amount.")
+        return
+    if amt_human <= 0:
+        print("Amount must be positive.")
+        return
+    amount_wei = int(amt_human * (10**USDC_E_DECIMALS))
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(USDC_E_POLYGON), abi=ERC20_MIN_ABI
+    )
+    bal = contract.functions.balanceOf(Web3.to_checksum_address(eoa)).call()
+    if bal < amount_wei:
+        print(
+            f"Insufficient USDC.e on your wallet. Have {bal / 10**USDC_E_DECIMALS:.6f}, need {amt_human:.6f}."
+        )
+        return
+    gas_bal = w3.eth.get_balance(Web3.to_checksum_address(eoa))
+    if gas_bal == 0:
+        print("Your wallet has 0 POL; you need POL on Polygon for gas.")
+        return
+    print(f"\nSend {amt_human} USDC.e from your wallet to proxy {safe}?")
+    if input("Confirm [y/N]: ").strip().lower() != "y":
+        print("Cancelled.")
+        return
+    try:
+        nonce = w3.eth.get_transaction_count(Web3.to_checksum_address(eoa))
+        gas_price = _polygon_bumped_legacy_gas_price_wei(w3)
+        tx = contract.functions.transfer(
+            Web3.to_checksum_address(safe), amount_wei
+        ).build_transaction(
+            {
+                "from": Web3.to_checksum_address(eoa),
+                "nonce": nonce,
+                "gas": 120000,
+                "gasPrice": gas_price,
+                "chainId": POLYGON_CHAIN_ID,
+            }
+        )
+        signed = account.sign_transaction(tx)
+        raw = getattr(signed, "raw_transaction", None) or getattr(
+            signed, "rawTransaction", None
+        )
+        if raw is None:
+            print("Signing failed.")
+            return
+        h = w3.eth.send_raw_transaction(raw)
+        print(f"Submitted. Tx hash: {Web3.to_hex(h)}")
+    except Exception as exc:
+        print(f"Deposit failed: {exc}")
+
+
+def _fetch_polymarket_bridge_evm_address(safe: str) -> tuple[str | None, str | None]:
+    """
+    POST bridge deposit API; return (checksummed EVM deposit address, optional API note) or (None, None).
+    """
+    try:
+        r = requests.post(
+            POLYMARKET_BRIDGE_DEPOSIT_URL,
+            json={"address": Web3.to_checksum_address(safe)},
+            timeout=30,
+        )
+        if not r.ok:
+            print(f"Bridge API HTTP {r.status_code}")
+            try:
+                print(json.dumps(r.json(), indent=2))
+            except Exception:
+                print(r.text)
+            return None, None
+        j = r.json()
+    except Exception as exc:
+        print(f"Bridge request failed: {exc}")
+        return None, None
+
+    evm = None
+    if isinstance(j, dict):
+        addr = j.get("address")
+        if isinstance(addr, dict):
+            evm = addr.get("evm")
+        evm = evm or j.get("evm")
+    if not evm:
+        print("Unexpected bridge response (no EVM address):")
+        print(json.dumps(j, indent=2) if isinstance(j, dict) else j)
+        return None, None
+    try:
+        chk = Web3.to_checksum_address(evm)
+    except Exception:
+        print(f"Invalid EVM address from bridge: {evm!r}")
+        return None, None
+    note = j.get("note") if isinstance(j, dict) else None
+    note_s = str(note) if note else None
+    return chk, note_s
+
+
+def _bridge_deposit_execute(w3: Web3, safe: str, account: Account) -> None:
+    """Sign and broadcast native USDC or POL from this EOA to Polymarket bridge (credits proxy)."""
+    bridge_to, api_note = _fetch_polymarket_bridge_evm_address(safe)
+    if not bridge_to:
+        return
+    eoa = account.address
+    eoa_cs = Web3.to_checksum_address(eoa)
+
+    print("\nPolymarket bridge (send from this wallet)")
+    print(f"  Your proxy will be credited: {safe}")
+    print(f"  On-chain recipient: {bridge_to}")
+    if api_note:
+        print(f"  {api_note}")
+
+    print("\n  1) Native USDC (ERC-20 on Polygon)")
+    print("  2) POL (native token)")
+    print("  3) Cancel")
+    asset = input("\nChoose what to send: ").strip()
+    if asset == "3" or not asset:
+        print("Cancelled.")
+        return
+    if asset not in ("1", "2"):
+        print("Invalid choice.")
+        return
+
+    amt_s = input("Amount to send (human units): ").strip()
+    try:
+        amt_human = float(amt_s)
+    except ValueError:
+        print("Invalid amount.")
+        return
+    if amt_human <= 0:
+        print("Amount must be positive.")
+        return
+
+    gas_price = _polygon_bumped_legacy_gas_price_wei(w3)
+    nonce = w3.eth.get_transaction_count(eoa_cs)
+
+    if asset == "1":
+        amount_wei = int(amt_human * (10**USDC_E_DECIMALS))
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(NATIVE_USDC_POLYGON), abi=ERC20_MIN_ABI
+        )
+        bal = contract.functions.balanceOf(eoa_cs).call()
+        if bal < amount_wei:
+            print(
+                f"Insufficient native USDC. Have {bal / 10**USDC_E_DECIMALS:.6f}, need {amt_human:.6f}."
+            )
+            return
+        pol_bal = w3.eth.get_balance(eoa_cs)
+        est_gas_cost = gas_price * 120000
+        if pol_bal < est_gas_cost:
+            print(
+                f"Insufficient POL for gas (need ~{est_gas_cost / 10**18:.6f} POL). "
+                f"Have {pol_bal / 10**18:.6f}."
+            )
+            return
+        print(
+            f"\nSend {amt_human} native USDC to bridge → proxy {safe}? "
+            f"Tx to {bridge_to}"
+        )
+        if input("Confirm [y/N]: ").strip().lower() != "y":
+            print("Cancelled.")
+            return
+        try:
+            tx = contract.functions.transfer(bridge_to, amount_wei).build_transaction(
+                {
+                    "from": eoa_cs,
+                    "nonce": nonce,
+                    "gas": 120000,
+                    "gasPrice": gas_price,
+                    "chainId": POLYGON_CHAIN_ID,
+                }
+            )
+            signed = account.sign_transaction(tx)
+            raw = getattr(signed, "raw_transaction", None) or getattr(
+                signed, "rawTransaction", None
+            )
+            if raw is None:
+                print("Signing failed.")
+                return
+            h = w3.eth.send_raw_transaction(raw)
+            print(f"Submitted. Tx hash: {Web3.to_hex(h)}")
+            print("After the tx confirms, the bridge may take a few minutes to credit your proxy.")
+        except Exception as exc:
+            print(f"Bridge deposit failed: {exc}")
+        return
+
+    # POL native transfer
+    amount_wei = int(amt_human * 10**18)
+    gas_limit = 21000
+    pol_bal = w3.eth.get_balance(eoa_cs)
+    gas_cost = gas_price * gas_limit
+    if pol_bal < amount_wei + gas_cost:
+        print(
+            f"Insufficient POL. Need {amt_human:.6f} + ~{gas_cost / 10**18:.6f} gas; "
+            f"have {pol_bal / 10**18:.6f}."
+        )
+        return
+    print(
+        f"\nSend {amt_human} POL to bridge → proxy {safe}? Tx to {bridge_to}"
+    )
+    if input("Confirm [y/N]: ").strip().lower() != "y":
+        print("Cancelled.")
+        return
+    try:
+        tx = {
+            "from": eoa_cs,
+            "to": bridge_to,
+            "value": amount_wei,
+            "nonce": nonce,
+            "gas": gas_limit,
+            "gasPrice": gas_price,
+            "chainId": POLYGON_CHAIN_ID,
+        }
+        signed = account.sign_transaction(tx)
+        raw = getattr(signed, "raw_transaction", None) or getattr(
+            signed, "rawTransaction", None
+        )
+        if raw is None:
+            print("Signing failed.")
+            return
+        h = w3.eth.send_raw_transaction(raw)
+        print(f"Submitted. Tx hash: {Web3.to_hex(h)}")
+        print("After the tx confirms, the bridge may take a few minutes to credit your proxy.")
+    except Exception as exc:
+        print(f"Bridge deposit failed: {exc}")
+
+
+def funds_deposit_to_proxy() -> None:
+    """Polygon EVM only: deposit USDC.e from EOA, or bridge native USDC/POL (EVM deposit address)."""
+    global CURRENT_SESSION
+    if not CURRENT_SESSION:
+        print("No active trading session.")
+        return
+    safe = (CURRENT_SESSION.get("data") or {}).get("proxyWallet") or _get_credential(
+        "EOA_PROXY_FUNDER"
+    )
+    if not safe:
+        print("No proxy wallet on session.")
+        return
+    eoa = (CURRENT_SESSION.get("data") or {}).get("walletAddress") or _get_credential(
+        "EOA_WALLET_ADDRESS"
+    )
+    pk = _get_credential("EOA_WALLET_PK")
+    if not pk:
+        print("EOA_WALLET_PK missing.")
+        return
+    if not pk.startswith("0x"):
+        pk = "0x" + pk
+    try:
+        account = Account.from_key(pk)
+    except Exception as exc:
+        print(f"Invalid private key: {exc}")
+        return
+    if account.address.lower() != (eoa or "").lower():
+        print("Warning: private key does not match session / EOA_WALLET_ADDRESS.")
+
+    print("\nDeposit to proxy (Polygon)")
+    print(f"  Proxy (EVM): {safe}")
+    print("  Use your Polygon EVM private key / wallet; balances below are on chain ID 137.")
+
+    w3 = get_polygon_web3()
+    if w3 and eoa:
+        _print_eoa_balances_for_deposit(w3, eoa)
+    else:
+        print(
+            f"\n(RPC not available — could not load Polygon balances. "
+            f"Endpoint: {_polygon_rpc_url()!r}.)"
+        )
+
+    print("\n  1) Transfer USDC.e from this EOA to the proxy (POL on Polygon for gas)")
+    print("  2) Polymarket bridge — send native USDC or POL from this wallet (on-chain)")
+    print("  3) Back")
+    sub = input("\nEnter choice: ").strip()
+    if sub == "1":
+        if not w3:
+            print(
+                "USDC.e transfer needs a working Polygon RPC. "
+                "Check POLYGON_RPC_URL or your network."
+            )
+            input("\nPress Enter to continue...")
+            return
+        _transfer_usdc_e_eoa_to_proxy(w3, safe, account)
+        input("\nPress Enter to continue...")
+    elif sub == "2":
+        if not w3:
+            print(
+                "Bridge deposit from this wallet needs a working Polygon RPC. "
+                "Check POLYGON_RPC_URL or your network."
+            )
+            input("\nPress Enter to continue...")
+            return
+        _bridge_deposit_execute(w3, safe, account)
+        input("\nPress Enter to continue...")
+    elif sub == "3":
+        return
+    else:
+        print("Invalid choice.")
+        input("\nPress Enter to continue...")
+
+
+class AlmanacRelayClient(RelayClient):
+    """
+    Default RelayClient passes str(dict) into builder-sign; the relayer POST uses
+    the same dict encoded with requests' json.dumps(..., allow_nan=False). Polymarket
+    verifies the HMAC against that JSON, so builder-sign must sign the identical
+    string (see Almanac builder-sign + @polymarket/builder-signing-sdk contract).
+    """
+
+    def poll_until_state(
+        self,
+        transaction_id: str,
+        states: list,
+        fail_state: str,
+        max_polls: int | None = None,
+        poll_frequency: int | None = None,
+    ):
+        """Same as RelayClient.poll_until_state but with a short user-facing status line."""
+        target_states = set(list(states))
+        poll_limit = max_polls if max_polls is not None else 10
+        poll_frequency_ms = 2000
+        if poll_frequency is not None and poll_frequency >= 1000:
+            poll_frequency_ms = poll_frequency
+
+        print("Waiting for confirmation...")
+
+        for _ in range(poll_limit):
+            transactions = self.get_transaction(transaction_id)
+            if transactions:
+                txn = transactions[0]
+                txn_state = txn.get("state")
+                if (
+                    txn_state
+                    and isinstance(txn_state, str)
+                    and txn_state in target_states
+                ):
+                    return txn
+                if fail_state is not None and txn_state == fail_state:
+                    txn_hash = txn.get("transactionHash")
+                    self.logger.error(
+                        f"txn {transaction_id} failed onchain, transaction_hash: {txn_hash}!"
+                    )
+                    return None
+            time.sleep(poll_frequency_ms / 1000)
+
+        self.logger.info(
+            f"Transaction {transaction_id} not found or not in given states, timing out!"
+        )
+        return None
+
+    def _generate_builder_headers(
+        self, method: str, request_path: str, body: dict | None = None
+    ) -> dict | None:
+        body_for_sign: str | None = None
+        if body is not None:
+            body_for_sign = requests_json.dumps(body, allow_nan=False)
+        headers = self.builder_config.generate_builder_headers(
+            method, request_path, body_for_sign
+        )
+        return headers.to_dict() if headers is not None else None
+
+
+class AlmanacRelayBuilderConfig:
+    """
+    Calls Almanac POST /v1/auth/builder-sign and returns BuilderHeaderPayload.
+    The stock RemoteBuilderConfig path returns a plain dict, but RelayClient expects .to_dict().
+    Pass trading session headers so Almanac can return relayer-valid builder credentials.
+    """
+
+    def __init__(self, sign_url: str, session_headers: dict | None = None):
+        self._sign_url = sign_url.rstrip("/")
+        self._session_headers = dict(session_headers) if session_headers else {}
+
+    def generate_builder_headers(
+        self,
+        method: str,
+        path: str,
+        body: str | None = None,
+        timestamp: int | None = None,
+    ):
+        ts = int(time.time()) if timestamp is None else int(timestamp)
+        payload = {
+            "method": method,
+            "path": path,
+            "body": body,
+            "timestamp": ts,
+        }
+        req_headers = {"Content-Type": "application/json", **self._session_headers}
+        try:
+            r = requests.post(
+                self._sign_url,
+                json=payload,
+                headers=req_headers,
+                timeout=30,
+            )
+            if not r.ok:
+                return None
+            d = r.json()
+            if not isinstance(d, dict):
+                return None
+        except Exception:
+            return None
+        def _g(*keys: str) -> str | None:
+            for k in keys:
+                if k in d and d[k] is not None:
+                    return str(d[k])
+            return None
+
+        key = _g("POLY_BUILDER_API_KEY", "polyBuilderApiKey", "apiKey")
+        hdr_ts = _g("POLY_BUILDER_TIMESTAMP", "polyBuilderTimestamp", "timestamp")
+        phrase = _g("POLY_BUILDER_PASSPHRASE", "polyBuilderPassphrase", "passphrase")
+        sig = _g("POLY_BUILDER_SIGNATURE", "polyBuilderSignature", "signature")
+        if not all((key, hdr_ts, phrase, sig)):
+            return None
+        return BuilderHeaderPayload(
+            POLY_BUILDER_API_KEY=key,
+            POLY_BUILDER_TIMESTAMP=hdr_ts,
+            POLY_BUILDER_PASSPHRASE=phrase,
+            POLY_BUILDER_SIGNATURE=sig,
+        )
+
+
+def _make_relay_client() -> RelayClient | None:
+    global CURRENT_SESSION
+    pk = _get_credential("EOA_WALLET_PK")
+    if not pk:
+        print("EOA_WALLET_PK missing.")
+        return None
+    if not pk.startswith("0x"):
+        pk = "0x" + pk
+    session_headers: dict[str, str] = {}
+    if CURRENT_SESSION:
+        sdata = CURRENT_SESSION.get("data") or {}
+        sid = sdata.get("sessionId")
+        waddr = sdata.get("walletAddress") or _get_credential("EOA_WALLET_ADDRESS")
+        if sid:
+            session_headers["x-session-id"] = sid
+        if waddr:
+            session_headers["x-wallet-address"] = str(waddr).lower()
+    try:
+        builder = AlmanacRelayBuilderConfig(
+            f"{ALMANAC_API_URL}/v1/auth/builder-sign",
+            session_headers=session_headers,
+        )
+        return AlmanacRelayClient(
+            POLYMARKET_RELAYER_URL,
+            POLYGON_CHAIN_ID,
+            pk,
+            builder,
+        )
+    except Exception as exc:
+        print(f"Could not create relay client: {exc}")
+        return None
+
+
+def funds_withdraw_usdc_e() -> None:
+    """Withdraw USDC.e from proxy/Safe via Polymarket relayer (gasless)."""
+    global CURRENT_SESSION
+    if not CURRENT_SESSION:
+        print("No active trading session.")
+        return
+    session_proxy = (CURRENT_SESSION.get("data") or {}).get("proxyWallet") or _get_credential(
+        "EOA_PROXY_FUNDER"
+    )
+    default_dest = (
+        (CURRENT_SESSION.get("data") or {}).get("walletAddress")
+        or _get_credential("EOA_WALLET_ADDRESS")
+    )
+
+    print("\nWithdraw USDC.e from proxy")
+    if session_proxy:
+        print(f"  Proxy: {session_proxy}")
+    raw_bal = fetch_auth_balances_raw()
+    if raw_bal:
+        fb = _extract_proxy_usdc_formatted(raw_bal)
+        if fb is not None:
+            print(f"  USDC.e (trading balance): {fb}")
+        else:
+            print("  USDC.e (trading balance): unavailable from API response.")
+    else:
+        print("  USDC.e (trading balance): not loaded (API error above, if any).")
+
+    client = _make_relay_client()
+    if not client:
+        return
+    try:
+        derived_safe = client.get_expected_safe()
+    except Exception as exc:
+        print(f"Could not derive Safe: {exc}")
+        input("\nPress Enter to continue...")
+        return
+    if (
+        session_proxy
+        and derived_safe
+        and session_proxy.lower() != derived_safe.lower()
+    ):
+        print(
+            f"Note: session proxy {session_proxy} != relayer derived Safe {derived_safe}; using relayer derivation."
+        )
+
+    dest = input(f"\nDestination address [{default_dest}]: ").strip() or default_dest
+    try:
+        dest_chk = Web3.to_checksum_address(dest)
+    except Exception:
+        print("Invalid destination address.")
+        return
+    amt_s = input("USDC.e amount to withdraw (human units): ").strip()
+    try:
+        amt_human = float(amt_s)
+    except ValueError:
+        print("Invalid amount.")
+        return
+    if amt_human <= 0:
+        print("Amount must be positive.")
+        return
+    amount_wei = int(amt_human * (10**USDC_E_DECIMALS))
+
+    w3 = get_polygon_web3()
+    if not w3:
+        print(
+            f"Could not connect to {_polygon_rpc_url()!r} for calldata encoding; "
+            "using offline Web3. Set POLYGON_RPC_URL if encoding fails."
+        )
+        w3 = Web3()
+    try:
+        data = _encode_erc20_transfer(w3, USDC_E_POLYGON, dest_chk, amount_wei)
+    except Exception as exc:
+        print(f"Encode failed: {exc}")
+        input("\nPress Enter to continue...")
+        return
+
+    txn = SafeTransaction(
+        to=Web3.to_checksum_address(USDC_E_POLYGON),
+        operation=OperationType.Call,
+        data=data,
+        value="0",
+    )
+    print(f"\nWithdraw {amt_human} USDC.e to {dest_chk} via relayer?")
+    if input("Confirm [y/N]: ").strip().lower() != "y":
+        print("Cancelled.")
+        input("\nPress Enter to continue...")
+        return
+    try:
+        resp = client.execute([txn], "Withdraw USDC.e")
+        result = resp.wait()
+        if result is not None:
+            print("Withdraw succeeded.")
+        else:
+            print("Withdraw failed or timed out (check relayer / Polygon explorer).")
+    except RelayerClientException as exc:
+        print(f"Relayer error: {exc}")
+        if getattr(exc, "status_code", None) == 401:
+            print(
+                "  Builder auth was rejected by the relayer. Try: Trading menu → "
+                "Refresh Trading Session, then withdraw again. If it still fails, "
+                "Almanac may need to align builder-sign with Polymarket’s relayer, or "
+                "your account may need Builder Program access on Polymarket’s side."
+            )
+    except Exception as exc:
+        print(f"Withdraw failed: {exc}")
+    input("\nPress Enter to continue...")
+
+
+def funds_menu() -> None:
+    while True:
+        print("\nFunds (balance / deposit / withdraw):")
+        print("  1) Proxy wallet balance")
+        print("  2) Deposit to proxy")
+        print("  3) Withdraw USDC.e from proxy/safe")
+        print("  4) Back to Trading Menu")
+        c = input("\nEnter choice: ").strip()
+        if c == "1":
+            funds_show_balance()
+        elif c == "2":
+            funds_deposit_to_proxy()
+        elif c == "3":
+            funds_withdraw_usdc_e()
+        elif c == "4":
+            break
+        else:
+            print("Invalid choice. Enter 1–4.\n")
+
 
 def _format_position_value(value, is_pnl=False, is_current_value=False):
     """Format a position value (price, size, etc.) for display."""
@@ -2338,8 +3536,10 @@ def start_trading_flow():
         print("  1) Search and Trade Markets")
         print("  2) See Positions")
         print("  3) See Orders")
-        print("  4) Refresh Trading Session")
-        print("  5) Back to Main Menu")
+        print("  4) Claim Polymarket Proceeds")
+        print("  5) Funds (balance / deposit / withdraw)")
+        print("  6) Refresh Trading Session")
+        print("  7) Back to Main Menu")
         choice = input("\nEnter choice: ").strip()
 
         if choice == "1":
@@ -2349,6 +3549,10 @@ def start_trading_flow():
         elif choice == "3":
             orders_menu()
         elif choice == "4":
+            claim_proceeds_menu()
+        elif choice == "5":
+            funds_menu()
+        elif choice == "6":
             try:
                 session = initiate_trading_session()
                 if session:
@@ -2358,10 +3562,10 @@ def start_trading_flow():
                     print("Trading session could not be refreshed.")
             except Exception as exc:
                 print(f"Failed to refresh trading session: {exc}")
-        elif choice == "5":
+        elif choice == "7":
             break
         else:
-            print("Invalid choice. Please enter a number from 1 to 5.\n")
+            print("Invalid choice. Please enter a number from 1 to 7.\n")
 
 def initiate_trading_session():
     """
@@ -3346,7 +4550,7 @@ def interactive_setup():
 
     while True:
         print("\nPlease choose an option:")
-        print("  1) Start Trading")
+        print("  1) Trading, Positions, Claims, Funds")
         print("  2) Generate Polymarket API credentials")
         print("  3) Link Bittensor UID to Almanac account")
         if len(CREDENTIAL_SETS) > 1:

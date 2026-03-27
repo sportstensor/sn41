@@ -1,0 +1,9 @@
+requests
+dotenv
+py-clob-client
+bittensor
+tabulate
+web3
+eth-account
+py-builder-relayer-client
+py-builder-signing-sdk
