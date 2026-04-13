@@ -34,6 +34,8 @@ pip install requests dotenv py-clob-client eth-account bittensor tabulate
 
 import os
 import json
+import math
+import urllib.parse
 from pathlib import Path
 import requests
 from dotenv import load_dotenv
@@ -685,6 +687,24 @@ def _update_all_markets_prices_from_clob(markets: list) -> list:
     
     return markets
 
+def fetch_fee_rate_bps(token_id: str | None, timeout: float = 3.0) -> int:
+    """
+    Match frontend useFeeRate: GET /fee-rate?token_id=... -> { "base_fee": int }.
+    Returns basis points; 0 on failure / missing token (same as feeRateBps ?? 0).
+    """
+    if not token_id:
+        return 0
+    try:
+        q = urllib.parse.urlencode({"token_id": str(token_id)})
+        r = requests.get(f"{POLYMARKET_CLOB_HOST}/fee-rate?{q}", timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict) and isinstance(data.get("base_fee"), (int, float)):
+            return int(data["base_fee"])
+    except Exception:
+        pass
+    return 0
+
 def _update_market_prices_from_clob(market: dict) -> dict:
     """
     Fetch latest prices from CLOB API and update the market's outcome_prices.
@@ -881,11 +901,16 @@ def _place_order_now(market: dict, chosen_outcome_name: str | None = None, chose
             print("Size must be > 0 and price must be in (0, 1]. Try again.")
             continue
         
-        # For sell orders: check available shares
+        # For sell orders: cap at exact position size from API (never round available_shares for the order)
         if side == "sell" and available_shares is not None:
-            if size > available_shares:
-                print(f"Cannot sell {size:.2f} shares. You only have {available_shares:.2f} shares available.")
-                continue
+            raw_available = float(available_shares)
+            requested = size
+            size = min(size, raw_available)
+            if requested > raw_available and round(requested, 2) != round(raw_available, 2):
+                print(
+                    f"Sell size capped to your position: {raw_available:.2f} shares "
+                    f"(requested {requested:.2f})."
+                )
         
         # For buy orders: check $5 minimum
         if side == "buy":
@@ -894,6 +919,13 @@ def _place_order_now(market: dict, chosen_outcome_name: str | None = None, chose
                 print(f"Order notional ${notional:.2f} is below the $5 minimum. Please increase size and/or price.")
                 continue
         break
+    
+    # SELL: CLOB EIP-712 uses round(size, 2) in micro-units; floor to 0.01-share grid so we never exceed balance
+    if side == "sell":
+        size = _normalize_sell_size_for_clob(size)
+        if size <= 0:
+            print("Sell size is below 0.01 shares after aligning to the exchange grid. Nothing to sell.")
+            return
     
     # Order type input with cancel option
     print("\nOrder Type:")
@@ -926,9 +958,12 @@ def _place_order_now(market: dict, chosen_outcome_name: str | None = None, chose
     
     # Calculate with adjusted price (what will actually be sent to API)
     notional = size * adjusted_price
-    fee = notional * VOLUME_FEE
-    total_with_fee = notional + fee
-    
+    if side_upper == "BUY":
+        fee = notional * VOLUME_FEE
+        total_with_fee = notional + fee
+    else:
+        total_with_fee = notional
+
     # Display summary with actual values
     print("\n" + "="*60)
     print("Order Summary:")
@@ -946,7 +981,8 @@ def _place_order_now(market: dict, chosen_outcome_name: str | None = None, chose
     else:
         print(f"Price: {price}")
     print(f"Subtotal: ${notional:.2f}")
-    print(f"Platform Fee ({VOLUME_FEE*100:.1f}%): ${fee:.2f}")
+    if side_upper == "BUY":
+        print(f"Platform Fee ({VOLUME_FEE*100:.1f}%): ${fee:.2f}")
     print(f"Total: ${total_with_fee:.2f}")
     print("="*60)
     
@@ -2452,6 +2488,18 @@ def initiate_trading_session():
         return None
     return response.json()
 
+
+def _normalize_sell_size_for_clob(size: float) -> float:
+    """
+    Polymarket-style orders encode sell `makerAmount` from round(size, 2) * 1e6.
+    A position like 5.5555 rounds to 5.56 on-chain and can exceed the wallet → INSUFFICIENT_BALANCE.
+    Floor to the 0.01-share grid in micro-units so the signed amount never exceeds `size`.
+    """
+    micro = math.floor(float(size) * 1_000_000 + 1e-6)
+    aligned = (micro // 10_000) * 10_000
+    return aligned / 1_000_000
+
+
 def place_order(
     market_id: str,
     side_upper: str,
@@ -2469,18 +2517,11 @@ def place_order(
       - x-session-id
       - x-wallet-address
 
-    Request body supported by server (simple flow):
-      - marketId: string (required)
-      - tokenId: string (optional)
-      - side: "BUY" | "SELL" (optional)
-      - orderType: "GTC" | "FOK" | "FAK" (optional; default "GTC")
-      - price: float between 0.01 and 0.99 (optional)
-      - size: float >= POLYMARKET_MIN_ORDER (optional)
-      - signature: string (optional)
-      - signedOrder: object (optional; advanced flow)
-      - signedOrder.signature: string (optional)
-      - signedOrder.orderPayload: object (optional)
-      - userWalletAddress: string (optional)
+    Request body (signed flow — must match Almanac + Polymarket SDK flat shape):
+      - marketId, orderType, userWalletAddress
+      - signedOrder: { salt, maker, signer, taker, tokenId, makerAmount, takerAmount,
+          expiration, nonce, feeRateBps, side, signatureType, signature }
+      All order fields and signature are on the SAME object (not signedOrder.orderPayload).
     """
     global CURRENT_SESSION
     if not CURRENT_SESSION:
@@ -2505,6 +2546,12 @@ def place_order(
     if wallet_address:
         headers["x-wallet-address"] = wallet_address
 
+    if side_upper == "SELL":
+        size = _normalize_sell_size_for_clob(size)
+        if size <= 0:
+            print("Sell size is below 0.01 shares after aligning to the exchange grid. Nothing to sell.")
+            return
+
     # Attempt EIP-712 signed order flow if config present
     exchange_address = EIP712_DOMAIN_NEGRISK_CONTRACT if neg_risk else EIP712_DOMAIN_CONTRACT
     private_key = _get_credential("EOA_WALLET_PK")
@@ -2519,50 +2566,55 @@ def place_order(
                 """Round to specified number of decimals, matching TypeScript roundToDecimals"""
                 factor = 10 ** decimals
                 return round(float(x) * factor) / factor
-            
+
             def to_6d_int(x: float) -> int:
                 """Match TypeScript: round(stake, 2) * 1e6, then round to nearest integer"""
                 rounded = round_to_decimals(x, 2)
                 return int(round(rounded * 1_000_000))
-            
+
             # Build order payload
             side_num = 0 if side_upper == "BUY" else 1
             # use BigInt(Date.now()) for salt
             salt = int(time.time() * 1000)
-            
+
             # Size is shares, apply ±PRICE_BUFFER_ADJUSTMENT for leeway
             # This ensures effective price is slightly worse to prevent rejection due to rounding
+            #
+            # USDC leg must be derived from the same share micro-units as the share leg. Rounding
+            # (size * price) to cents separately from rounding size breaks implied price (e.g. 5.55
+            # shares @ 0.50 -> 2.78 USDC rounded -> implied 0.50090..., which fails min tick 0.01).
+            shares_micro = to_6d_int(size)
             if side_num == 0:  # BUY
                 # For BUY: size is shares we want to receive
                 # Adjust price upward to ensure effective price >= orderbook price
-                # makerAmount: USDC we pay = shares * (price + PRICE_BUFFER_ADJUSTMENT)
+                # makerAmount: USDC we pay; takerAmount: shares we receive
                 if order_type in ("FOK", "FAK"):
                     adjusted_price = price + PRICE_BUFFER_ADJUSTMENT
                 else:
                     adjusted_price = price
-                usdc_amount = round_to_decimals(size * adjusted_price, 2)
-                maker_amount = int(round(usdc_amount * 1_000_000))
-                
-                # takerAmount: shares we receive
-                taker_amount = to_6d_int(size)
+                taker_amount = shares_micro
             else:  # SELL
-                # For SELL: size is shares we want to sell
-                # Adjust price downward to ensure effective price <= orderbook price
-                # makerAmount: shares we sell
-                maker_amount = to_6d_int(size)
-                
-                # takerAmount: USDC we receive = shares * (price - PRICE_BUFFER_ADJUSTMENT)
+                # For SELL: makerAmount shares we sell; takerAmount USDC we receive
                 if order_type in ("FOK", "FAK"):
                     adjusted_price = max(0.01, price - PRICE_BUFFER_ADJUSTMENT)  # Ensure price doesn't go negative
                 else:
                     adjusted_price = price
-                usdc_amount = round_to_decimals(size * adjusted_price, 2)
-                taker_amount = int(round(usdc_amount * 1_000_000))
+                maker_amount = shares_micro
 
-            # Frontend sets expiration and nonce to 0, feeRateBps to 0
+            # Limit price on 0.01 tick; pair amounts so implied price matches the grid exactly
+            price_cents = int(round(round_to_decimals(adjusted_price, 2) * 100))
+            price_cents = max(1, min(100, price_cents))
+            if side_num == 0:  # BUY
+                maker_amount = (taker_amount * price_cents + 50) // 100
+            else:  # SELL
+                taker_amount = (maker_amount * price_cents + 50) // 100
+
+            # Frontend sets expiration and nonce to 0; feeRateBps from CLOB (fallback 0)
             expiration = 0
             nonce = 0
-            fee_bps = 0
+            fee_bps = fetch_fee_rate_bps(
+                str(chosen_token_id) if chosen_token_id is not None else None
+            )
             # tokenId parse
             token_id_int = 0
             if chosen_token_id is not None:
@@ -2623,8 +2675,8 @@ def place_order(
             signature_hex = signed.signature.hex()
             if not signature_hex.startswith("0x"):
                 signature_hex = "0x" + signature_hex
-            # Convert numeric fields to strings for backend
-            order_payload_str = {
+            # Convert numeric fields to strings for backend (flat signedOrder — same object the UI sends)
+            order_fields_for_api = {
                 "salt": str(order_payload["salt"]),
                 "maker": order_payload["maker"],
                 "signer": order_payload["signer"],
@@ -2638,11 +2690,12 @@ def place_order(
                 "side": order_payload["side"],
                 "signatureType": order_payload["signatureType"],
             }
+            # Almanac backend + relayer expect SDK-style flat signedOrder (no nested orderPayload)
             signed_flow_payload = {
                 "marketId": market_id,
                 "signedOrder": {
+                    **order_fields_for_api,
                     "signature": signature_hex,
-                    "orderPayload": order_payload_str,
                 },
                 "orderType": order_type,
                 "userWalletAddress": wallet_address,
