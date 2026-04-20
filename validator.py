@@ -29,7 +29,7 @@ class Validator:
         self.setup_logging()
         self.setup_bittensor_objects()
         self.last_update = 0
-        self.scoring_minute = random.randint(5, 15)  # Run once per hour at this minute (UTC)
+        self.scoring_minute = random.randint(10, 25)  # Run once per hour at this minute (UTC)
         self.current_block = 0
         self.node = SubstrateInterface(url=self.config.subtensor.chain_endpoint)
         self.tempo = self.node_query('SubtensorModule', 'Tempo', [self.config.netuid])
@@ -294,7 +294,7 @@ class Validator:
                     response = requests.get(
                         url, 
                         auth=HTTPBasicAuth(hotkey, signature),
-                        timeout=20
+                        timeout=30
                     )
                     response.raise_for_status()
                     api_response = response.json()
