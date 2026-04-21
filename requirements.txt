@@ -1,5 +1,6 @@
 bittensor==9.12.2
 substrate-interface
+async-substrate-interface>=1.5.6,<2
 wandb
 
 pandas
