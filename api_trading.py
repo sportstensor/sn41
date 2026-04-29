@@ -25,24 +25,23 @@ Python dependencies:
 - requests
 - dotenv
 - tabulate
-- py-clob-client
+- py-clob-client-v2
 - eth-account
 - bittensor
 
-pip install requests dotenv py-clob-client eth-account bittensor tabulate
+pip install requests dotenv eth-account bittensor tabulate py-clob-client-v2
 """
 
 import os
 import json
 import math
-import urllib.parse
 from pathlib import Path
 import requests
 from dotenv import load_dotenv
-from py_clob_client.client import ClobClient
+from py_clob_client_v2 import ClobClient, OrderArgs, PartialCreateOrderOptions
+from py_clob_client_v2.order_builder.constants import BUY, SELL
 from eth_account import Account
 from eth_account.messages import encode_defunct
-from eth_account.messages import encode_typed_data as EIP712_ENCODE  # type: ignore
 import time
 import secrets
 import bittensor as bt
@@ -54,9 +53,12 @@ ALMANAC_API_URL = "https://api.almanac.market/api"
 #ALMANAC_API_URL = "http://localhost:3001/api"
 POLYMARKET_CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
-# EIP-712 domain contract for Polymarket CTF Exchange
-EIP712_DOMAIN_CONTRACT = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-EIP712_DOMAIN_NEGRISK_CONTRACT = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+# EIP-712 domain contract for Polymarket CTF Exchange -- V2
+EIP712_DOMAIN_CONTRACT = "0xE111180000d2663C0091e4f400237545B87B996B"
+EIP712_DOMAIN_NEGRISK_CONTRACT = "0xe2222d279d744050d28e00520010520000310F59"
+# EIP-712 domain contract for Polymarket CTF Exchange -- V1 (DEPRECATED)
+#EIP712_DOMAIN_CONTRACT = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+#EIP712_DOMAIN_NEGRISK_CONTRACT = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 ENV_PATH = Path("api_trading.env")
 
 # Default number of positions to fetch per page
@@ -686,24 +688,6 @@ def _update_all_markets_prices_from_clob(markets: list) -> list:
                 market["_clob_prices"] = market_clob_prices
     
     return markets
-
-def fetch_fee_rate_bps(token_id: str | None, timeout: float = 3.0) -> int:
-    """
-    Match frontend useFeeRate: GET /fee-rate?token_id=... -> { "base_fee": int }.
-    Returns basis points; 0 on failure / missing token (same as feeRateBps ?? 0).
-    """
-    if not token_id:
-        return 0
-    try:
-        q = urllib.parse.urlencode({"token_id": str(token_id)})
-        r = requests.get(f"{POLYMARKET_CLOB_HOST}/fee-rate?{q}", timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, dict) and isinstance(data.get("base_fee"), (int, float)):
-            return int(data["base_fee"])
-    except Exception:
-        pass
-    return 0
 
 def _update_market_prices_from_clob(market: dict) -> dict:
     """
@@ -2489,6 +2473,37 @@ def initiate_trading_session():
     return response.json()
 
 
+def _extract_signed_order_dict(signed_order) -> dict:
+    """
+    Normalize SDK signed-order objects to a plain dict for Almanac API payloads.
+    """
+    if isinstance(signed_order, dict):
+        data = dict(signed_order)
+    elif hasattr(signed_order, "model_dump"):
+        data = signed_order.model_dump()  # pydantic v2
+    elif hasattr(signed_order, "dict"):
+        data = signed_order.dict()  # pydantic v1
+    elif hasattr(signed_order, "__dict__"):
+        data = dict(signed_order.__dict__)
+    else:
+        raise TypeError("Unsupported signed order type from py-clob-client-v2")
+
+    # Convert enum-like values from SDK models into JSON-friendly primitives.
+    for key, value in list(data.items()):
+        if hasattr(value, "value"):
+            data[key] = value.value
+
+    # Our backend expects side as BUY/SELL in the wire payload.
+    side_val = data.get("side")
+    if isinstance(side_val, str):
+        upper = side_val.upper()
+        data["side"] = "BUY" if upper.endswith("BUY") else ("SELL" if upper.endswith("SELL") else upper)
+    elif isinstance(side_val, int):
+        data["side"] = "BUY" if side_val == 0 else "SELL"
+
+    return data
+
+
 def _normalize_sell_size_for_clob(size: float) -> float:
     """
     Polymarket-style orders encode sell `makerAmount` from round(size, 2) * 1e6.
@@ -2517,10 +2532,9 @@ def place_order(
       - x-session-id
       - x-wallet-address
 
-    Request body (signed flow — must match Almanac + Polymarket SDK flat shape):
+    Request body (signed flow — must match Almanac + CLOB v2 signed order shape):
       - marketId, orderType, userWalletAddress
-      - signedOrder: { salt, maker, signer, taker, tokenId, makerAmount, takerAmount,
-          expiration, nonce, feeRateBps, side, signatureType, signature }
+      - signedOrder: v2 order fields from py-clob-client-v2 (includes timestamp/metadata/builder)
       All order fields and signature are on the SAME object (not signedOrder.orderPayload).
     """
     global CURRENT_SESSION
@@ -2552,183 +2566,136 @@ def place_order(
             print("Sell size is below 0.01 shares after aligning to the exchange grid. Nothing to sell.")
             return
 
-    # Attempt EIP-712 signed order flow if config present
-    exchange_address = EIP712_DOMAIN_NEGRISK_CONTRACT if neg_risk else EIP712_DOMAIN_CONTRACT
     private_key = _get_credential("EOA_WALLET_PK")
-    signed_flow_payload = None
-    try:
-        if exchange_address and private_key and wallet_address:
-            if not private_key.startswith("0x"):
-                private_key = "0x" + private_key
-            # Numeric fields as ints for EIP-712
-            # Match TypeScript logic: round to 2 decimals, then multiply by 1e6, then round to integer
-            def round_to_decimals(x: float, decimals: int = 2) -> float:
-                """Round to specified number of decimals, matching TypeScript roundToDecimals"""
-                factor = 10 ** decimals
-                return round(float(x) * factor) / factor
+    if not private_key:
+        print("EOA_WALLET_PK is required to sign CLOB v2 orders.")
+        return
+    if not private_key.startswith("0x"):
+        private_key = "0x" + private_key
 
-            def to_6d_int(x: float) -> int:
-                """Match TypeScript: round(stake, 2) * 1e6, then round to nearest integer"""
-                rounded = round_to_decimals(x, 2)
-                return int(round(rounded * 1_000_000))
+    if chosen_token_id is None:
+        print("No token ID selected for this order. Please choose a market outcome first.")
+        return
 
-            # Build order payload
-            side_num = 0 if side_upper == "BUY" else 1
-            # use BigInt(Date.now()) for salt
-            salt = int(time.time() * 1000)
+    token_id = str(chosen_token_id)
+    if order_type in ("FOK", "FAK"):
+        adjusted_price = price + PRICE_BUFFER_ADJUSTMENT if side_upper == "BUY" else max(0.01, price - PRICE_BUFFER_ADJUSTMENT)
+    else:
+        adjusted_price = price
 
-            # Size is shares, apply ±PRICE_BUFFER_ADJUSTMENT for leeway
-            # This ensures effective price is slightly worse to prevent rejection due to rounding
-            #
-            # USDC leg must be derived from the same share micro-units as the share leg. Rounding
-            # (size * price) to cents separately from rounding size breaks implied price (e.g. 5.55
-            # shares @ 0.50 -> 2.78 USDC rounded -> implied 0.50090..., which fails min tick 0.01).
-            shares_micro = to_6d_int(size)
-            if side_num == 0:  # BUY
-                # For BUY: size is shares we want to receive
-                # Adjust price upward to ensure effective price >= orderbook price
-                # makerAmount: USDC we pay; takerAmount: shares we receive
-                if order_type in ("FOK", "FAK"):
-                    adjusted_price = price + PRICE_BUFFER_ADJUSTMENT
-                else:
-                    adjusted_price = price
-                taker_amount = shares_micro
-            else:  # SELL
-                # For SELL: makerAmount shares we sell; takerAmount USDC we receive
-                if order_type in ("FOK", "FAK"):
-                    adjusted_price = max(0.01, price - PRICE_BUFFER_ADJUSTMENT)  # Ensure price doesn't go negative
-                else:
-                    adjusted_price = price
-                maker_amount = shares_micro
+    use_proxy_funder = bool(proxy_address and wallet_address and proxy_address.lower() != wallet_address.lower())
+    signature_type_candidates = [1, 2] if use_proxy_funder else [None]
+    last_response = None
 
-            # Limit price on 0.01 tick; pair amounts so implied price matches the grid exactly
-            price_cents = int(round(round_to_decimals(adjusted_price, 2) * 100))
-            price_cents = max(1, min(100, price_cents))
-            if side_num == 0:  # BUY
-                maker_amount = (taker_amount * price_cents + 50) // 100
-            else:  # SELL
-                taker_amount = (maker_amount * price_cents + 50) // 100
+    for idx, sig_type in enumerate(signature_type_candidates):
+        signed_flow_payload = None
+        try:
+            client_kwargs = {
+                "host": POLYMARKET_CLOB_HOST,
+                "chain_id": POLYGON_CHAIN_ID,
+                "key": private_key,
+            }
+            if use_proxy_funder:
+                client_kwargs["funder"] = proxy_address
+                if sig_type is not None:
+                    client_kwargs["signature_type"] = sig_type
 
-            # Frontend sets expiration and nonce to 0; feeRateBps from CLOB (fallback 0)
-            expiration = 0
-            nonce = 0
-            fee_bps = fetch_fee_rate_bps(
-                str(chosen_token_id) if chosen_token_id is not None else None
+            client = ClobClient(**client_kwargs)
+
+            tick_size = "0.01"
+            try:
+                dynamic_tick_size = client.get_tick_size(token_id)
+                if dynamic_tick_size:
+                    tick_size = str(dynamic_tick_size)
+            except Exception:
+                pass
+
+            try:
+                dynamic_neg_risk = client.get_neg_risk(token_id)
+                if isinstance(dynamic_neg_risk, bool):
+                    neg_risk = dynamic_neg_risk
+            except Exception:
+                pass
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=float(adjusted_price),
+                size=float(size),
+                side=BUY if side_upper == "BUY" else SELL,
             )
-            # tokenId parse
-            token_id_int = 0
-            if chosen_token_id is not None:
-                try:
-                    token_id_int = int(str(chosen_token_id), 10)
-                except Exception:
-                    token_id_int = 0
-            order_payload = {
-                "salt": salt,
-                "maker": proxy_address,
-                "signer": wallet_address,
-                "taker": "0x0000000000000000000000000000000000000000",
-                "tokenId": token_id_int,
-                "makerAmount": maker_amount,
-                "takerAmount": taker_amount,
-                "expiration": expiration,
-                "nonce": nonce,
-                "feeRateBps": fee_bps,
-                "side": side_num,
-                "signatureType": 2,
-            }
-            # EIP-712 typed data (Polymarket-esque order schema)
-            typed_data = {
-                "types": {
-                    "EIP712Domain": [
-                        {"name": "name", "type": "string"},
-                        {"name": "version", "type": "string"},
-                        {"name": "chainId", "type": "uint256"},
-                        {"name": "verifyingContract", "type": "address"},
-                    ],
-                    "Order": [
-                        {"name": "salt", "type": "uint256"},
-                        {"name": "maker", "type": "address"},
-                        {"name": "signer", "type": "address"},
-                        {"name": "taker", "type": "address"},
-                        {"name": "tokenId", "type": "uint256"},
-                        {"name": "makerAmount", "type": "uint256"},
-                        {"name": "takerAmount", "type": "uint256"},
-                        {"name": "expiration", "type": "uint256"},
-                        {"name": "nonce", "type": "uint256"},
-                        {"name": "feeRateBps", "type": "uint256"},
-                        {"name": "side", "type": "uint8"},
-                        {"name": "signatureType", "type": "uint8"},
-                    ],
-                },
-                "primaryType": "Order",
-                "domain": {
-                    "name": "Polymarket CTF Exchange",
-                    "version": "1",
-                    "chainId": POLYGON_CHAIN_ID,
-                    "verifyingContract": exchange_address,
-                },
-                "message": order_payload,
-            }
-            # eth-account 0.13.x: pass full_message=typed_data
-            eip712_msg = EIP712_ENCODE(full_message=typed_data)
-            signed = Account.from_key(private_key).sign_message(eip712_msg)
-            signature_hex = signed.signature.hex()
-            if not signature_hex.startswith("0x"):
-                signature_hex = "0x" + signature_hex
-            # Convert numeric fields to strings for backend (flat signedOrder — same object the UI sends)
-            order_fields_for_api = {
-                "salt": str(order_payload["salt"]),
-                "maker": order_payload["maker"],
-                "signer": order_payload["signer"],
-                "taker": order_payload["taker"],
-                "tokenId": str(order_payload["tokenId"]),
-                "makerAmount": str(order_payload["makerAmount"]),
-                "takerAmount": str(order_payload["takerAmount"]),
-                "expiration": str(order_payload["expiration"]),
-                "nonce": str(order_payload["nonce"]),
-                "feeRateBps": str(order_payload["feeRateBps"]),
-                "side": order_payload["side"],
-                "signatureType": order_payload["signatureType"],
-            }
-            # Almanac backend + relayer expect SDK-style flat signedOrder (no nested orderPayload)
+            options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=bool(neg_risk))
+            signed_order = client.create_order(order_args=order_args, options=options)
+            order_fields_for_api = _extract_signed_order_dict(signed_order)
+
+            for key in ("salt", "tokenId", "makerAmount", "takerAmount", "expiration", "timestamp"):
+                if key in order_fields_for_api and order_fields_for_api[key] is not None:
+                    order_fields_for_api[key] = str(order_fields_for_api[key])
+            for key in ("metadata", "builder"):
+                if key in order_fields_for_api and isinstance(order_fields_for_api[key], bytes):
+                    order_fields_for_api[key] = "0x" + order_fields_for_api[key].hex()
+
             signed_flow_payload = {
                 "marketId": market_id,
-                "signedOrder": {
-                    **order_fields_for_api,
-                    "signature": signature_hex,
-                },
+                "signedOrder": order_fields_for_api,
                 "orderType": order_type,
                 "userWalletAddress": wallet_address,
             }
-    except Exception as _exc:
-        # Fallback to simple flow below if signing fails
-        signed_flow_payload = None
-        import traceback
-        traceback.print_exc()
+        except Exception:
+            signed_flow_payload = None
+            import traceback
+            traceback.print_exc()
 
-    if signed_flow_payload is None:
-        print("Failed to build signed order payload. Aborting without sending.")
-        return
-    payload = signed_flow_payload
+        if signed_flow_payload is None:
+            if idx == len(signature_type_candidates) - 1:
+                print("Failed to build signed order payload. Aborting without sending.")
+                return
+            continue
 
-    try:
-        resp = requests.post(
-            f"{ALMANAC_API_URL}/v1/trading/orders",
-            headers=headers,
-            json=payload,
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            print("Failed to place order:")
-            try:
-                print(json.dumps(resp.json(), indent=2))
-            except Exception:
-                print(resp.text)
+        try:
+            resp = requests.post(
+                f"{ALMANAC_API_URL}/v1/trading/orders",
+                headers=headers,
+                json=signed_flow_payload,
+                timeout=30,
+            )
+            last_response = resp
+        except Exception as exc:
+            if idx == len(signature_type_candidates) - 1:
+                print(f"Order error: {exc}")
+                return
+            continue
+
+        if resp.status_code == 200:
+            print("Order placed:")
+            print(json.dumps(resp.json(), indent=2))
             return
-        print("Order placed:")
-        print(json.dumps(resp.json(), indent=2))
-    except Exception as exc:
-        print(f"Order error: {exc}")
+
+        # Some backends still verify proxy orders using signatureType=2; retry once.
+        should_retry_invalid_sig = False
+        try:
+            body = resp.json() or {}
+            details = body.get("details") if isinstance(body, dict) else {}
+            error_text = str((details or {}).get("error") or body.get("error") or "").lower()
+            should_retry_invalid_sig = "invalid signature" in error_text
+        except Exception:
+            should_retry_invalid_sig = False
+
+        if should_retry_invalid_sig and idx < len(signature_type_candidates) - 1:
+            continue
+
+        print("Failed to place order:")
+        try:
+            print(json.dumps(resp.json(), indent=2))
+        except Exception:
+            print(resp.text)
+        return
+
+    if last_response is not None:
+        print("Failed to place order:")
+        try:
+            print(json.dumps(last_response.json(), indent=2))
+        except Exception:
+            print(last_response.text)
 
 def search_markets():
     """
@@ -3313,7 +3280,7 @@ def generate_polymarket_credentials():
     # Create client and generate credentials
     client = ClobClient(host=POLYMARKET_CLOB_HOST, key=private_key, chain_id=POLYGON_CHAIN_ID)
     try:
-        credentials = client.create_or_derive_api_creds()
+        credentials = client.create_or_derive_api_key()
     except Exception as exc:
         print(f"Failed to create Polymarket API credentials: {exc}")
         return
