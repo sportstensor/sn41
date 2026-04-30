@@ -38,7 +38,7 @@ import math
 from pathlib import Path
 import requests
 from dotenv import load_dotenv
-from py_clob_client_v2 import ClobClient, OrderArgs, PartialCreateOrderOptions
+from py_clob_client_v2 import ClobClient, OrderArgs, MarketOrderArgs, OrderType, PartialCreateOrderOptions
 from py_clob_client_v2.order_builder.constants import BUY, SELL
 from eth_account import Account
 from eth_account.messages import encode_defunct
@@ -2617,14 +2617,26 @@ def place_order(
             except Exception:
                 pass
 
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=float(adjusted_price),
-                size=float(size),
-                side=BUY if side_upper == "BUY" else SELL,
-            )
             options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=bool(neg_risk))
-            signed_order = client.create_order(order_args=order_args, options=options)
+            if order_type in ("FOK", "FAK"):
+                # CLOB v2 market orders require BUY amount in USDC (2dp max) and enforce stricter precision.
+                market_amount = round(float(size) * float(adjusted_price), 2) if side_upper == "BUY" else round(float(size), 4)
+                market_order_args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=market_amount,
+                    side=BUY if side_upper == "BUY" else SELL,
+                    price=float(adjusted_price),
+                    order_type=OrderType.FOK if order_type == "FOK" else OrderType.FAK,
+                )
+                signed_order = client.create_market_order(order_args=market_order_args, options=options)
+            else:
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=float(adjusted_price),
+                    size=float(size),
+                    side=BUY if side_upper == "BUY" else SELL,
+                )
+                signed_order = client.create_order(order_args=order_args, options=options)
             order_fields_for_api = _extract_signed_order_dict(signed_order)
 
             for key in ("salt", "tokenId", "makerAmount", "takerAmount", "expiration", "timestamp"):
