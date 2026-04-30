@@ -53,7 +53,7 @@ ESGP_LOSS_COMPENSATION_PERCENTAGE = 1.0
 
 # This is used to give more weights (and in turn, more incentives) to the miners by taking the final miner pool weights and boosting them by this percentage.
 # Set to 0 to disable.
-MINER_POOL_WEIGHT_BOOST_PERCENTAGE = 3
+MINER_POOL_WEIGHT_BOOST_PERCENTAGE = 1
 
 TOTAL_MINER_ALPHA_PER_DAY = 2952 # 7200 alpha per day for entire subnet * 0.41 (41% for miners)
 

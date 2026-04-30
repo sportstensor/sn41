@@ -8,7 +8,7 @@ It allows you to:
 - Initiate trading sessions and place orders
 - Fetch positions summary
 - Check and claim Polymarket proceeds (Almanac redeem + Polymarket relayer; batch losing cleanup)
-- Funds: proxy wallet balance (API), deposit to proxy (USDC.e or Polymarket bridge native USDC/POL), withdraw via relayer
+- Funds: proxy wallet balance (API), deposit to proxy (USDC.e or Polymarket bridge native USDC/POL), withdraw pUSD via relayer
 - Link/unlink Bittensor UID to Almanac account
 - Manage multiple credential sets (wallet accounts)
 
@@ -29,12 +29,11 @@ Python dependencies:
 - requests
 - dotenv
 - tabulate
-- py-clob-client
+- py-clob-client-v2
 - eth-account
 - bittensor
 - web3
 - py-builder-relayer-client
-- py-builder-signing-sdk
 
 pip install -r requirements-trading.txt
 """
@@ -42,14 +41,14 @@ pip install -r requirements-trading.txt
 import os
 import json
 import math
-import urllib.parse
+from dataclasses import dataclass
 from pathlib import Path
 import requests
 from dotenv import load_dotenv
-from py_clob_client.client import ClobClient
+from py_clob_client_v2 import ClobClient, OrderArgs, MarketOrderArgs, OrderType, PartialCreateOrderOptions
+from py_clob_client_v2.order_builder.constants import BUY, SELL
 from eth_account import Account
 from eth_account.messages import encode_defunct
-from eth_account.messages import encode_typed_data as EIP712_ENCODE  # type: ignore
 import time
 import secrets
 import bittensor as bt
@@ -61,13 +60,11 @@ from requests.compat import json as requests_json
 from py_builder_relayer_client.client import RelayClient
 from py_builder_relayer_client.models import OperationType, SafeTransaction
 from py_builder_relayer_client.exceptions import RelayerClientException
-from py_builder_signing_sdk.sdk_types import BuilderHeaderPayload
 
 ALMANAC_API_URL = "https://api.almanac.market/api"
 #ALMANAC_API_URL = "http://localhost:3001/api"
 POLYMARKET_CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
-
 # Polymarket data-api: redeemable positions (aligned with Almanac ClaimProceedsModal)
 POLY_POSITIONS_WINNERS_URL = (
     "https://data-api.polymarket.com/positions"
@@ -83,14 +80,25 @@ VALUE_WINNER_MIN = 0.01
 VALUE_LOSER_MAX = 0.01
 SIZE_MIN_TOKENS = 0.1
 
-# Polygon USDC.e (bridged) — Polymarket trading balance on proxy/Safe
+# Polygon proxy/Safe settlement token (Polymarket v2)
+PROXY_TOKEN_SYMBOL = "pUSD"
+PROXY_TOKEN_POLYGON = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+# Polygon USDC.e (bridged)
 USDC_E_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 NATIVE_USDC_POLYGON = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+# CLOB V2 collateral wrap/unwrap contracts
+# wrap(asset, to, amount): USDC/USDC.e -> pUSD
+# unwrap(asset, to, amount): pUSD -> USDC/USDC.e
+COLLATERAL_ONRAMP_ADDRESS = "0x93070a847efEf7F70739046A929D47a521F5B8ee"
+COLLATERAL_OFFRAMP_ADDRESS = "0x2957922Eb93258b93368531d39fAcCA3B4dC5854"
 POLYMARKET_BRIDGE_DEPOSIT_URL = "https://bridge.polymarket.com/deposit"
 POLYMARKET_RELAYER_URL = "https://relayer-v2.polymarket.com"
 # https://docs.polygon.technology/pos/reference/rpc-endpoints/ (mainnet table + public RPCs)
 DEFAULT_POLYGON_RPC_URL = "https://polygon.drpc.org"
 USDC_E_DECIMALS = 6
+PROXY_TOKEN_DECIMALS = 6
+AUTO_WRAP_USDCE_PROCEEDS = True
+UINT256_MAX = (1 << 256) - 1
 
 ERC20_MIN_ABI = [
     {
@@ -117,11 +125,48 @@ ERC20_MIN_ABI = [
         "inputs": [],
         "outputs": [{"type": "uint8"}],
     },
+    {
+        "type": "function",
+        "name": "allowance",
+        "stateMutability": "view",
+        "inputs": [
+            {"name": "owner", "type": "address"},
+            {"name": "spender", "type": "address"},
+        ],
+        "outputs": [{"name": "remaining", "type": "uint256"}],
+    },
+    {
+        "type": "function",
+        "name": "approve",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "spender", "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "outputs": [{"type": "bool"}],
+    },
 ]
 
-# EIP-712 domain contract for Polymarket CTF Exchange
-EIP712_DOMAIN_CONTRACT = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-EIP712_DOMAIN_NEGRISK_CONTRACT = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+COLLATERAL_ONRAMP_WRAP_ABI = [
+    {
+        "type": "function",
+        "name": "wrap",
+        "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "_asset", "type": "address"},
+            {"name": "_to", "type": "address"},
+            {"name": "_amount", "type": "uint256"},
+        ],
+        "outputs": [],
+    }
+]
+
+# EIP-712 domain contract for Polymarket CTF Exchange -- V2
+EIP712_DOMAIN_CONTRACT = "0xE111180000d2663C0091e4f400237545B87B996B"
+EIP712_DOMAIN_NEGRISK_CONTRACT = "0xe2222d279d744050d28e00520010520000310F59"
+# EIP-712 domain contract for Polymarket CTF Exchange -- V1 (DEPRECATED)
+#EIP712_DOMAIN_CONTRACT = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+#EIP712_DOMAIN_NEGRISK_CONTRACT = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 ENV_PATH = Path("api_trading.env")
 
 # Default number of positions to fetch per page
@@ -751,24 +796,6 @@ def _update_all_markets_prices_from_clob(markets: list) -> list:
                 market["_clob_prices"] = market_clob_prices
     
     return markets
-
-def fetch_fee_rate_bps(token_id: str | None, timeout: float = 3.0) -> int:
-    """
-    Match frontend useFeeRate: GET /fee-rate?token_id=... -> { "base_fee": int }.
-    Returns basis points; 0 on failure / missing token (same as feeRateBps ?? 0).
-    """
-    if not token_id:
-        return 0
-    try:
-        q = urllib.parse.urlencode({"token_id": str(token_id)})
-        r = requests.get(f"{POLYMARKET_CLOB_HOST}/fee-rate?{q}", timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, dict) and isinstance(data.get("base_fee"), (int, float)):
-            return int(data["base_fee"])
-    except Exception:
-        pass
-    return 0
 
 def _update_market_prices_from_clob(market: dict) -> dict:
     """
@@ -1518,11 +1545,48 @@ def _post_almanac_redeem_prepare(redemptions: list) -> tuple[bool, str | None, d
         return False, str(exc), None
 
 
-def _relay_submit_redeem_transactions(txs_raw: list) -> tuple[bool, str | None]:
+def _relay_submit_redeem_transactions(
+    txs_raw: list, redeem_payload: dict | None = None
+) -> tuple[bool, str | None]:
     """Submit redeem calldata from Almanac through Polymarket relayer (same path as withdraw)."""
+    global CURRENT_SESSION
+    load_dotenv(dotenv_path=str(ENV_PATH), override=True)
     client = _make_relay_client()
     if not client:
         return False, "Could not create relayer client (EOA_WALLET_PK or builder-sign)."
+    proxy_addr = (CURRENT_SESSION.get("data") or {}).get("proxyWallet") if CURRENT_SESSION else None
+    if not proxy_addr:
+        proxy_addr = _get_credential("EOA_PROXY_FUNDER")
+    onramp_addr = (
+        os.environ.get("COLLATERAL_ONRAMP_ADDRESS", COLLATERAL_ONRAMP_ADDRESS) or ""
+    ).strip()
+    should_auto_wrap = bool(
+        AUTO_WRAP_USDCE_PROCEEDS
+        and onramp_addr
+        and proxy_addr
+        and _payload_has_usdce_redemptions(redeem_payload)
+    )
+    w3: Web3 | None = None
+    usdce_before: int | None = None
+    if should_auto_wrap:
+        w3 = get_polygon_web3()
+        if w3 is None:
+            print(
+                "Auto-wrap skipped: Polygon RPC unavailable; set POLYGON_RPC_URL and wrap manually if needed."
+            )
+            should_auto_wrap = False
+        else:
+            try:
+                usdce_before = _read_erc20_balance_wei(w3, USDC_E_POLYGON, proxy_addr)
+            except Exception as exc:
+                print(f"Auto-wrap skipped: could not read pre-claim USDC.e balance ({exc}).")
+                should_auto_wrap = False
+    elif AUTO_WRAP_USDCE_PROCEEDS and _payload_has_usdce_redemptions(redeem_payload) and not onramp_addr:
+        print(
+            "Auto-wrap skipped: COLLATERAL_ONRAMP_ADDRESS is not set. "
+            f"Set it in {ENV_PATH} to auto-convert claimed USDC.e into {PROXY_TOKEN_SYMBOL}."
+        )
+
     relay_txs: list[SafeTransaction] = []
     for t in txs_raw:
         if not isinstance(t, dict):
@@ -1562,6 +1626,29 @@ def _relay_submit_redeem_transactions(txs_raw: list) -> tuple[bool, str | None]:
                 th = result.get("transactionHash") or result.get("transaction_hash")
                 if th:
                     print(f"Polygon transaction hash: {th}")
+            if should_auto_wrap and w3 is not None and proxy_addr and usdce_before is not None:
+                try:
+                    usdce_after = _read_erc20_balance_wei(w3, USDC_E_POLYGON, proxy_addr)
+                except Exception as exc:
+                    return (
+                        True,
+                        "Claim succeeded, but could not read post-claim USDC.e balance for auto-wrap: "
+                        f"{exc}",
+                    )
+                delta = max(0, int(usdce_after) - int(usdce_before))
+                if delta > 0:
+                    ok_wrap, wrap_err = _auto_wrap_usdce_proceeds(
+                        client, w3, proxy_addr, onramp_addr, delta
+                    )
+                    if not ok_wrap:
+                        return (
+                            True,
+                            "Claim succeeded, but auto-wrap USDC.e -> "
+                            f"{PROXY_TOKEN_SYMBOL} failed: {wrap_err}",
+                        )
+                    print(f"Auto-wrap complete: converted claimed USDC.e into {PROXY_TOKEN_SYMBOL}.")
+                else:
+                    print("Auto-wrap skipped: no newly claimed USDC.e detected.")
             return True, None
         return False, "Relayer did not confirm the transaction (timeout or on-chain failure)."
     except RelayerClientException as exc:
@@ -1588,7 +1675,7 @@ def request_redeem_transactions(redemptions: list) -> tuple[bool, str | None]:
 
     txs_raw = payload.get("transactions")
     if isinstance(txs_raw, list) and len(txs_raw) > 0:
-        return _relay_submit_redeem_transactions(txs_raw)
+        return _relay_submit_redeem_transactions(txs_raw, redeem_payload=payload)
 
     api_msg = payload.get("message") or ""
     return (
@@ -1673,6 +1760,8 @@ def claim_proceeds_menu():
     ok, err = request_redeem_transactions(plan["redemptions"])
     if ok:
         print("\nClaim succeeded (relayer confirmed on-chain).")
+        if err:
+            print(err)
     else:
         print("\nClaim failed.")
         if err:
@@ -1736,6 +1825,120 @@ def _encode_erc20_transfer(w3: Web3, token: str, to_addr: str, amount_wei: int) 
     return s if s.startswith("0x") else "0x" + s
 
 
+def _encode_erc20_approve(w3: Web3, token: str, spender: str, amount_wei: int) -> str:
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(token), abi=ERC20_MIN_ABI
+    )
+    data = contract.encode_abi(
+        abi_element_identifier="approve",
+        args=[Web3.to_checksum_address(spender), int(amount_wei)],
+    )
+    if isinstance(data, bytes):
+        return "0x" + data.hex()
+    s = str(data)
+    return s if s.startswith("0x") else "0x" + s
+
+
+def _encode_onramp_wrap(
+    w3: Web3, onramp_addr: str, asset_addr: str, to_addr: str, amount_wei: int
+) -> str:
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(onramp_addr), abi=COLLATERAL_ONRAMP_WRAP_ABI
+    )
+    data = contract.encode_abi(
+        abi_element_identifier="wrap",
+        args=[
+            Web3.to_checksum_address(asset_addr),
+            Web3.to_checksum_address(to_addr),
+            int(amount_wei),
+        ],
+    )
+    if isinstance(data, bytes):
+        return "0x" + data.hex()
+    s = str(data)
+    return s if s.startswith("0x") else "0x" + s
+
+
+def _read_erc20_balance_wei(w3: Web3, token: str, owner: str) -> int:
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(token), abi=ERC20_MIN_ABI
+    )
+    return int(contract.functions.balanceOf(Web3.to_checksum_address(owner)).call())
+
+
+def _read_erc20_allowance_wei(w3: Web3, token: str, owner: str, spender: str) -> int:
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(token), abi=ERC20_MIN_ABI
+    )
+    return int(
+        contract.functions.allowance(
+            Web3.to_checksum_address(owner), Web3.to_checksum_address(spender)
+        ).call()
+    )
+
+
+def _payload_has_usdce_redemptions(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    prepared = payload.get("redemptions")
+    if not isinstance(prepared, list):
+        return False
+    for item in prepared:
+        if not isinstance(item, dict):
+            continue
+        sel = str(item.get("selectedCollateral") or "").strip().lower()
+        if sel == USDC_E_POLYGON.lower():
+            return True
+    return False
+
+
+def _auto_wrap_usdce_proceeds(
+    client: RelayClient, w3: Web3, proxy_addr: str, onramp_addr: str, amount_wei: int
+) -> tuple[bool, str | None]:
+    try:
+        allowance = _read_erc20_allowance_wei(
+            w3, USDC_E_POLYGON, proxy_addr, onramp_addr
+        )
+    except Exception as exc:
+        return False, f"Could not read USDC.e allowance: {exc}"
+
+    if allowance < amount_wei:
+        try:
+            print("Approving USDC.e for collateral onramp...")
+            approve_data = _encode_erc20_approve(
+                w3, USDC_E_POLYGON, onramp_addr, UINT256_MAX
+            )
+            approve_tx = SafeTransaction(
+                to=Web3.to_checksum_address(USDC_E_POLYGON),
+                operation=OperationType.Call,
+                data=approve_data,
+                value="0",
+            )
+            ar = client.execute([approve_tx], "Approve USDC.e for auto-wrap")
+            if ar.wait() is None:
+                return False, "Approval transaction timed out or failed."
+        except Exception as exc:
+            return False, f"USDC.e approval failed: {exc}"
+
+    try:
+        print(f"Wrapping {amount_wei / (10**USDC_E_DECIMALS):.6f} USDC.e into {PROXY_TOKEN_SYMBOL}...")
+        wrap_data = _encode_onramp_wrap(
+            w3, onramp_addr, USDC_E_POLYGON, proxy_addr, amount_wei
+        )
+        wrap_tx = SafeTransaction(
+            to=Web3.to_checksum_address(onramp_addr),
+            operation=OperationType.Call,
+            data=wrap_data,
+            value="0",
+        )
+        wr = client.execute([wrap_tx], f"Auto-wrap USDC.e to {PROXY_TOKEN_SYMBOL}")
+        if wr.wait() is None:
+            return False, "Wrap transaction timed out or failed."
+        return True, None
+    except Exception as exc:
+        return False, f"USDC.e wrap failed: {exc}"
+
+
 def fetch_auth_balances_raw() -> dict | None:
     """GET /v1/auth/balances/{eoa} with session headers. Returns parsed JSON dict or None."""
     global CURRENT_SESSION
@@ -1771,7 +1974,7 @@ def fetch_auth_balances_raw() -> dict | None:
         return None
 
 
-def _extract_proxy_usdc_formatted(payload: dict) -> str | None:
+def _extract_proxy_token_formatted(payload: dict) -> str | None:
     if not isinstance(payload, dict):
         return None
     root = payload.get("data")
@@ -1799,10 +2002,10 @@ def funds_show_balance() -> None:
     raw = fetch_auth_balances_raw()
     if raw is None:
         return
-    formatted = _extract_proxy_usdc_formatted(raw)
+    formatted = _extract_proxy_token_formatted(raw)
     print("\nSafe/Proxy wallet balance")
     if formatted is not None:
-        print(f"  USDC.e: {formatted}")
+        print(f"  {PROXY_TOKEN_SYMBOL}: {formatted}")
     else:
         print("  Could not read balance from API. Response keys:")
         print(json.dumps(list(raw.keys()) if isinstance(raw, dict) else raw, indent=2))
@@ -1810,19 +2013,24 @@ def funds_show_balance() -> None:
 
 
 def _print_eoa_balances_for_deposit(w3: Web3, eoa: str) -> None:
-    """USDC.e, native USDC, and POL on the EOA on Polygon (chain 137)."""
+    """pUSD, USDC.e, native USDC, and POL on the EOA on Polygon (chain 137)."""
     try:
         cs = Web3.to_checksum_address(eoa)
+        pusd = w3.eth.contract(
+            address=Web3.to_checksum_address(PROXY_TOKEN_POLYGON), abi=ERC20_MIN_ABI
+        )
         usdc_e = w3.eth.contract(
             address=Web3.to_checksum_address(USDC_E_POLYGON), abi=ERC20_MIN_ABI
         )
         native_u = w3.eth.contract(
             address=Web3.to_checksum_address(NATIVE_USDC_POLYGON), abi=ERC20_MIN_ABI
         )
+        p_wei = pusd.functions.balanceOf(cs).call()
         e_wei = usdc_e.functions.balanceOf(cs).call()
         n_wei = native_u.functions.balanceOf(cs).call()
         pol_wei = w3.eth.get_balance(cs)
         print(f"\nYour Polygon EVM wallet ({eoa})")
+        print(f"  {PROXY_TOKEN_SYMBOL}:        {p_wei / 10**PROXY_TOKEN_DECIMALS:.6f}")
         print(f"  USDC.e:      {e_wei / 10**USDC_E_DECIMALS:.6f}")
         print(f"  Native USDC: {n_wei / 10**USDC_E_DECIMALS:.6f}")
         print(f"  POL (gas):   {pol_wei / 10**18:.6f}")
@@ -1830,9 +2038,16 @@ def _print_eoa_balances_for_deposit(w3: Web3, eoa: str) -> None:
         print(f"\nCould not load EOA balances: {exc}")
 
 
-def _transfer_usdc_e_eoa_to_proxy(w3: Web3, safe: str, account: Account) -> None:
+def _transfer_erc20_eoa_to_proxy(
+    w3: Web3,
+    safe: str,
+    account: Account,
+    token_address: str,
+    token_symbol: str,
+    token_decimals: int,
+) -> None:
     eoa = account.address
-    amt_s = input("\nUSDC.e amount to send to proxy (human units, e.g. 10.5): ").strip()
+    amt_s = input(f"\n{token_symbol} amount to send to proxy (human units, e.g. 10.5): ").strip()
     try:
         amt_human = float(amt_s)
     except ValueError:
@@ -1841,21 +2056,21 @@ def _transfer_usdc_e_eoa_to_proxy(w3: Web3, safe: str, account: Account) -> None
     if amt_human <= 0:
         print("Amount must be positive.")
         return
-    amount_wei = int(amt_human * (10**USDC_E_DECIMALS))
+    amount_wei = int(amt_human * (10**token_decimals))
     contract = w3.eth.contract(
-        address=Web3.to_checksum_address(USDC_E_POLYGON), abi=ERC20_MIN_ABI
+        address=Web3.to_checksum_address(token_address), abi=ERC20_MIN_ABI
     )
     bal = contract.functions.balanceOf(Web3.to_checksum_address(eoa)).call()
     if bal < amount_wei:
         print(
-            f"Insufficient USDC.e on your wallet. Have {bal / 10**USDC_E_DECIMALS:.6f}, need {amt_human:.6f}."
+            f"Insufficient {token_symbol} on your wallet. Have {bal / 10**token_decimals:.6f}, need {amt_human:.6f}."
         )
         return
     gas_bal = w3.eth.get_balance(Web3.to_checksum_address(eoa))
     if gas_bal == 0:
         print("Your wallet has 0 POL; you need POL on Polygon for gas.")
         return
-    print(f"\nSend {amt_human} USDC.e from your wallet to proxy {safe}?")
+    print(f"\nSend {amt_human} {token_symbol} from your wallet to proxy {safe}?")
     if input("Confirm [y/N]: ").strip().lower() != "y":
         print("Cancelled.")
         return
@@ -2058,7 +2273,7 @@ def _bridge_deposit_execute(w3: Web3, safe: str, account: Account) -> None:
 
 
 def funds_deposit_to_proxy() -> None:
-    """Polygon EVM only: deposit USDC.e from EOA, or bridge native USDC/POL (EVM deposit address)."""
+    """Polygon EVM only: deposit pUSD/USDC.e from EOA, or bridge native USDC/POL (EVM deposit address)."""
     global CURRENT_SESSION
     if not CURRENT_SESSION:
         print("No active trading session.")
@@ -2099,11 +2314,29 @@ def funds_deposit_to_proxy() -> None:
             f"Endpoint: {_polygon_rpc_url()!r}.)"
         )
 
-    print("\n  1) Transfer USDC.e from this EOA to the proxy (POL on Polygon for gas)")
-    print("  2) Polymarket bridge — send native USDC or POL from this wallet (on-chain)")
-    print("  3) Back")
+    print(f"\n  1) Transfer {PROXY_TOKEN_SYMBOL} from this EOA to the proxy (POL on Polygon for gas)")
+    print("  2) Transfer USDC.e from this EOA to the proxy (POL on Polygon for gas)")
+    print("  3) Polymarket bridge — send native USDC or POL from this wallet (on-chain)")
+    print("  4) Back")
     sub = input("\nEnter choice: ").strip()
     if sub == "1":
+        if not w3:
+            print(
+                f"{PROXY_TOKEN_SYMBOL} transfer needs a working Polygon RPC. "
+                "Check POLYGON_RPC_URL or your network."
+            )
+            input("\nPress Enter to continue...")
+            return
+        _transfer_erc20_eoa_to_proxy(
+            w3,
+            safe,
+            account,
+            token_address=PROXY_TOKEN_POLYGON,
+            token_symbol=PROXY_TOKEN_SYMBOL,
+            token_decimals=PROXY_TOKEN_DECIMALS,
+        )
+        input("\nPress Enter to continue...")
+    elif sub == "2":
         if not w3:
             print(
                 "USDC.e transfer needs a working Polygon RPC. "
@@ -2111,9 +2344,16 @@ def funds_deposit_to_proxy() -> None:
             )
             input("\nPress Enter to continue...")
             return
-        _transfer_usdc_e_eoa_to_proxy(w3, safe, account)
+        _transfer_erc20_eoa_to_proxy(
+            w3,
+            safe,
+            account,
+            token_address=USDC_E_POLYGON,
+            token_symbol="USDC.e",
+            token_decimals=USDC_E_DECIMALS,
+        )
         input("\nPress Enter to continue...")
-    elif sub == "2":
+    elif sub == "3":
         if not w3:
             print(
                 "Bridge deposit from this wallet needs a working Polygon RPC. "
@@ -2123,7 +2363,7 @@ def funds_deposit_to_proxy() -> None:
             return
         _bridge_deposit_execute(w3, safe, account)
         input("\nPress Enter to continue...")
-    elif sub == "3":
+    elif sub == "4":
         return
     else:
         print("Invalid choice.")
@@ -2191,9 +2431,25 @@ class AlmanacRelayClient(RelayClient):
         return headers.to_dict() if headers is not None else None
 
 
+@dataclass
+class _BuilderHeaders:
+    POLY_BUILDER_API_KEY: str
+    POLY_BUILDER_TIMESTAMP: str
+    POLY_BUILDER_PASSPHRASE: str
+    POLY_BUILDER_SIGNATURE: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "POLY_BUILDER_API_KEY": self.POLY_BUILDER_API_KEY,
+            "POLY_BUILDER_TIMESTAMP": self.POLY_BUILDER_TIMESTAMP,
+            "POLY_BUILDER_PASSPHRASE": self.POLY_BUILDER_PASSPHRASE,
+            "POLY_BUILDER_SIGNATURE": self.POLY_BUILDER_SIGNATURE,
+        }
+
+
 class AlmanacRelayBuilderConfig:
     """
-    Calls Almanac POST /v1/auth/builder-sign and returns BuilderHeaderPayload.
+    Calls Almanac POST /v1/auth/builder-sign and returns relayer builder headers.
     The stock RemoteBuilderConfig path returns a plain dict, but RelayClient expects .to_dict().
     Pass trading session headers so Almanac can return relayer-valid builder credentials.
     """
@@ -2243,7 +2499,7 @@ class AlmanacRelayBuilderConfig:
         sig = _g("POLY_BUILDER_SIGNATURE", "polyBuilderSignature", "signature")
         if not all((key, hdr_ts, phrase, sig)):
             return None
-        return BuilderHeaderPayload(
+        return _BuilderHeaders(
             POLY_BUILDER_API_KEY=key,
             POLY_BUILDER_TIMESTAMP=hdr_ts,
             POLY_BUILDER_PASSPHRASE=phrase,
@@ -2285,7 +2541,7 @@ def _make_relay_client() -> RelayClient | None:
 
 
 def funds_withdraw_usdc_e() -> None:
-    """Withdraw USDC.e from proxy/Safe via Polymarket relayer (gasless)."""
+    """Withdraw proxy token from proxy/Safe via Polymarket relayer (gasless)."""
     global CURRENT_SESSION
     if not CURRENT_SESSION:
         print("No active trading session.")
@@ -2298,18 +2554,18 @@ def funds_withdraw_usdc_e() -> None:
         or _get_credential("EOA_WALLET_ADDRESS")
     )
 
-    print("\nWithdraw USDC.e from proxy")
+    print(f"\nWithdraw {PROXY_TOKEN_SYMBOL} from proxy")
     if session_proxy:
         print(f"  Proxy: {session_proxy}")
     raw_bal = fetch_auth_balances_raw()
     if raw_bal:
-        fb = _extract_proxy_usdc_formatted(raw_bal)
+        fb = _extract_proxy_token_formatted(raw_bal)
         if fb is not None:
-            print(f"  USDC.e (trading balance): {fb}")
+            print(f"  {PROXY_TOKEN_SYMBOL} (trading balance): {fb}")
         else:
-            print("  USDC.e (trading balance): unavailable from API response.")
+            print(f"  {PROXY_TOKEN_SYMBOL} (trading balance): unavailable from API response.")
     else:
-        print("  USDC.e (trading balance): not loaded (API error above, if any).")
+        print(f"  {PROXY_TOKEN_SYMBOL} (trading balance): not loaded (API error above, if any).")
 
     client = _make_relay_client()
     if not client:
@@ -2335,7 +2591,7 @@ def funds_withdraw_usdc_e() -> None:
     except Exception:
         print("Invalid destination address.")
         return
-    amt_s = input("USDC.e amount to withdraw (human units): ").strip()
+    amt_s = input(f"{PROXY_TOKEN_SYMBOL} amount to withdraw (human units): ").strip()
     try:
         amt_human = float(amt_s)
     except ValueError:
@@ -2344,7 +2600,7 @@ def funds_withdraw_usdc_e() -> None:
     if amt_human <= 0:
         print("Amount must be positive.")
         return
-    amount_wei = int(amt_human * (10**USDC_E_DECIMALS))
+    amount_wei = int(amt_human * (10**PROXY_TOKEN_DECIMALS))
 
     w3 = get_polygon_web3()
     if not w3:
@@ -2354,25 +2610,25 @@ def funds_withdraw_usdc_e() -> None:
         )
         w3 = Web3()
     try:
-        data = _encode_erc20_transfer(w3, USDC_E_POLYGON, dest_chk, amount_wei)
+        data = _encode_erc20_transfer(w3, PROXY_TOKEN_POLYGON, dest_chk, amount_wei)
     except Exception as exc:
         print(f"Encode failed: {exc}")
         input("\nPress Enter to continue...")
         return
 
     txn = SafeTransaction(
-        to=Web3.to_checksum_address(USDC_E_POLYGON),
+        to=Web3.to_checksum_address(PROXY_TOKEN_POLYGON),
         operation=OperationType.Call,
         data=data,
         value="0",
     )
-    print(f"\nWithdraw {amt_human} USDC.e to {dest_chk} via relayer?")
+    print(f"\nWithdraw {amt_human} {PROXY_TOKEN_SYMBOL} to {dest_chk} via relayer?")
     if input("Confirm [y/N]: ").strip().lower() != "y":
         print("Cancelled.")
         input("\nPress Enter to continue...")
         return
     try:
-        resp = client.execute([txn], "Withdraw USDC.e")
+        resp = client.execute([txn], f"Withdraw {PROXY_TOKEN_SYMBOL}")
         result = resp.wait()
         if result is not None:
             print("Withdraw succeeded.")
@@ -2397,7 +2653,7 @@ def funds_menu() -> None:
         print("\nFunds (balance / deposit / withdraw):")
         print("  1) Proxy wallet balance")
         print("  2) Deposit to proxy")
-        print("  3) Withdraw USDC.e from proxy/safe")
+        print(f"  3) Withdraw {PROXY_TOKEN_SYMBOL} from proxy/safe")
         print("  4) Back to Trading Menu")
         c = input("\nEnter choice: ").strip()
         if c == "1":
@@ -3693,6 +3949,37 @@ def initiate_trading_session():
     return response.json()
 
 
+def _extract_signed_order_dict(signed_order) -> dict:
+    """
+    Normalize SDK signed-order objects to a plain dict for Almanac API payloads.
+    """
+    if isinstance(signed_order, dict):
+        data = dict(signed_order)
+    elif hasattr(signed_order, "model_dump"):
+        data = signed_order.model_dump()  # pydantic v2
+    elif hasattr(signed_order, "dict"):
+        data = signed_order.dict()  # pydantic v1
+    elif hasattr(signed_order, "__dict__"):
+        data = dict(signed_order.__dict__)
+    else:
+        raise TypeError("Unsupported signed order type from py-clob-client-v2")
+
+    # Convert enum-like values from SDK models into JSON-friendly primitives.
+    for key, value in list(data.items()):
+        if hasattr(value, "value"):
+            data[key] = value.value
+
+    # Our backend expects side as BUY/SELL in the wire payload.
+    side_val = data.get("side")
+    if isinstance(side_val, str):
+        upper = side_val.upper()
+        data["side"] = "BUY" if upper.endswith("BUY") else ("SELL" if upper.endswith("SELL") else upper)
+    elif isinstance(side_val, int):
+        data["side"] = "BUY" if side_val == 0 else "SELL"
+
+    return data
+
+
 def _normalize_sell_size_for_clob(size: float) -> float:
     """
     Polymarket-style orders encode sell `makerAmount` from round(size, 2) * 1e6.
@@ -3721,10 +4008,9 @@ def place_order(
       - x-session-id
       - x-wallet-address
 
-    Request body (signed flow — must match Almanac + Polymarket SDK flat shape):
+    Request body (signed flow — must match Almanac + CLOB v2 signed order shape):
       - marketId, orderType, userWalletAddress
-      - signedOrder: { salt, maker, signer, taker, tokenId, makerAmount, takerAmount,
-          expiration, nonce, feeRateBps, side, signatureType, signature }
+      - signedOrder: v2 order fields from py-clob-client-v2 (includes timestamp/metadata/builder)
       All order fields and signature are on the SAME object (not signedOrder.orderPayload).
     """
     global CURRENT_SESSION
@@ -3756,183 +4042,148 @@ def place_order(
             print("Sell size is below 0.01 shares after aligning to the exchange grid. Nothing to sell.")
             return
 
-    # Attempt EIP-712 signed order flow if config present
-    exchange_address = EIP712_DOMAIN_NEGRISK_CONTRACT if neg_risk else EIP712_DOMAIN_CONTRACT
     private_key = _get_credential("EOA_WALLET_PK")
-    signed_flow_payload = None
-    try:
-        if exchange_address and private_key and wallet_address:
-            if not private_key.startswith("0x"):
-                private_key = "0x" + private_key
-            # Numeric fields as ints for EIP-712
-            # Match TypeScript logic: round to 2 decimals, then multiply by 1e6, then round to integer
-            def round_to_decimals(x: float, decimals: int = 2) -> float:
-                """Round to specified number of decimals, matching TypeScript roundToDecimals"""
-                factor = 10 ** decimals
-                return round(float(x) * factor) / factor
+    if not private_key:
+        print("EOA_WALLET_PK is required to sign CLOB v2 orders.")
+        return
+    if not private_key.startswith("0x"):
+        private_key = "0x" + private_key
 
-            def to_6d_int(x: float) -> int:
-                """Match TypeScript: round(stake, 2) * 1e6, then round to nearest integer"""
-                rounded = round_to_decimals(x, 2)
-                return int(round(rounded * 1_000_000))
+    if chosen_token_id is None:
+        print("No token ID selected for this order. Please choose a market outcome first.")
+        return
 
-            # Build order payload
-            side_num = 0 if side_upper == "BUY" else 1
-            # use BigInt(Date.now()) for salt
-            salt = int(time.time() * 1000)
+    token_id = str(chosen_token_id)
+    if order_type in ("FOK", "FAK"):
+        adjusted_price = price + PRICE_BUFFER_ADJUSTMENT if side_upper == "BUY" else max(0.01, price - PRICE_BUFFER_ADJUSTMENT)
+    else:
+        adjusted_price = price
 
-            # Size is shares, apply ±PRICE_BUFFER_ADJUSTMENT for leeway
-            # This ensures effective price is slightly worse to prevent rejection due to rounding
-            #
-            # USDC leg must be derived from the same share micro-units as the share leg. Rounding
-            # (size * price) to cents separately from rounding size breaks implied price (e.g. 5.55
-            # shares @ 0.50 -> 2.78 USDC rounded -> implied 0.50090..., which fails min tick 0.01).
-            shares_micro = to_6d_int(size)
-            if side_num == 0:  # BUY
-                # For BUY: size is shares we want to receive
-                # Adjust price upward to ensure effective price >= orderbook price
-                # makerAmount: USDC we pay; takerAmount: shares we receive
-                if order_type in ("FOK", "FAK"):
-                    adjusted_price = price + PRICE_BUFFER_ADJUSTMENT
-                else:
-                    adjusted_price = price
-                taker_amount = shares_micro
-            else:  # SELL
-                # For SELL: makerAmount shares we sell; takerAmount USDC we receive
-                if order_type in ("FOK", "FAK"):
-                    adjusted_price = max(0.01, price - PRICE_BUFFER_ADJUSTMENT)  # Ensure price doesn't go negative
-                else:
-                    adjusted_price = price
-                maker_amount = shares_micro
+    use_proxy_funder = bool(proxy_address and wallet_address and proxy_address.lower() != wallet_address.lower())
+    signature_type_candidates = [1, 2] if use_proxy_funder else [None]
+    last_response = None
 
-            # Limit price on 0.01 tick; pair amounts so implied price matches the grid exactly
-            price_cents = int(round(round_to_decimals(adjusted_price, 2) * 100))
-            price_cents = max(1, min(100, price_cents))
-            if side_num == 0:  # BUY
-                maker_amount = (taker_amount * price_cents + 50) // 100
-            else:  # SELL
-                taker_amount = (maker_amount * price_cents + 50) // 100
-
-            # Frontend sets expiration and nonce to 0; feeRateBps from CLOB (fallback 0)
-            expiration = 0
-            nonce = 0
-            fee_bps = fetch_fee_rate_bps(
-                str(chosen_token_id) if chosen_token_id is not None else None
-            )
-            # tokenId parse
-            token_id_int = 0
-            if chosen_token_id is not None:
-                try:
-                    token_id_int = int(str(chosen_token_id), 10)
-                except Exception:
-                    token_id_int = 0
-            order_payload = {
-                "salt": salt,
-                "maker": proxy_address,
-                "signer": wallet_address,
-                "taker": "0x0000000000000000000000000000000000000000",
-                "tokenId": token_id_int,
-                "makerAmount": maker_amount,
-                "takerAmount": taker_amount,
-                "expiration": expiration,
-                "nonce": nonce,
-                "feeRateBps": fee_bps,
-                "side": side_num,
-                "signatureType": 2,
+    for idx, sig_type in enumerate(signature_type_candidates):
+        signed_flow_payload = None
+        try:
+            client_kwargs = {
+                "host": POLYMARKET_CLOB_HOST,
+                "chain_id": POLYGON_CHAIN_ID,
+                "key": private_key,
             }
-            # EIP-712 typed data (Polymarket-esque order schema)
-            typed_data = {
-                "types": {
-                    "EIP712Domain": [
-                        {"name": "name", "type": "string"},
-                        {"name": "version", "type": "string"},
-                        {"name": "chainId", "type": "uint256"},
-                        {"name": "verifyingContract", "type": "address"},
-                    ],
-                    "Order": [
-                        {"name": "salt", "type": "uint256"},
-                        {"name": "maker", "type": "address"},
-                        {"name": "signer", "type": "address"},
-                        {"name": "taker", "type": "address"},
-                        {"name": "tokenId", "type": "uint256"},
-                        {"name": "makerAmount", "type": "uint256"},
-                        {"name": "takerAmount", "type": "uint256"},
-                        {"name": "expiration", "type": "uint256"},
-                        {"name": "nonce", "type": "uint256"},
-                        {"name": "feeRateBps", "type": "uint256"},
-                        {"name": "side", "type": "uint8"},
-                        {"name": "signatureType", "type": "uint8"},
-                    ],
-                },
-                "primaryType": "Order",
-                "domain": {
-                    "name": "Polymarket CTF Exchange",
-                    "version": "1",
-                    "chainId": POLYGON_CHAIN_ID,
-                    "verifyingContract": exchange_address,
-                },
-                "message": order_payload,
-            }
-            # eth-account 0.13.x: pass full_message=typed_data
-            eip712_msg = EIP712_ENCODE(full_message=typed_data)
-            signed = Account.from_key(private_key).sign_message(eip712_msg)
-            signature_hex = signed.signature.hex()
-            if not signature_hex.startswith("0x"):
-                signature_hex = "0x" + signature_hex
-            # Convert numeric fields to strings for backend (flat signedOrder — same object the UI sends)
-            order_fields_for_api = {
-                "salt": str(order_payload["salt"]),
-                "maker": order_payload["maker"],
-                "signer": order_payload["signer"],
-                "taker": order_payload["taker"],
-                "tokenId": str(order_payload["tokenId"]),
-                "makerAmount": str(order_payload["makerAmount"]),
-                "takerAmount": str(order_payload["takerAmount"]),
-                "expiration": str(order_payload["expiration"]),
-                "nonce": str(order_payload["nonce"]),
-                "feeRateBps": str(order_payload["feeRateBps"]),
-                "side": order_payload["side"],
-                "signatureType": order_payload["signatureType"],
-            }
-            # Almanac backend + relayer expect SDK-style flat signedOrder (no nested orderPayload)
+            if use_proxy_funder:
+                client_kwargs["funder"] = proxy_address
+                if sig_type is not None:
+                    client_kwargs["signature_type"] = sig_type
+
+            client = ClobClient(**client_kwargs)
+
+            tick_size = "0.01"
+            try:
+                dynamic_tick_size = client.get_tick_size(token_id)
+                if dynamic_tick_size:
+                    tick_size = str(dynamic_tick_size)
+            except Exception:
+                pass
+
+            try:
+                dynamic_neg_risk = client.get_neg_risk(token_id)
+                if isinstance(dynamic_neg_risk, bool):
+                    neg_risk = dynamic_neg_risk
+            except Exception:
+                pass
+
+            options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=bool(neg_risk))
+            if order_type in ("FOK", "FAK"):
+                # CLOB v2 market orders require BUY amount in USDC (2dp max) and enforce stricter precision.
+                market_amount = round(float(size) * float(adjusted_price), 2) if side_upper == "BUY" else round(float(size), 4)
+                market_order_args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=market_amount,
+                    side=BUY if side_upper == "BUY" else SELL,
+                    price=float(adjusted_price),
+                    order_type=OrderType.FOK if order_type == "FOK" else OrderType.FAK,
+                )
+                signed_order = client.create_market_order(order_args=market_order_args, options=options)
+            else:
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=float(adjusted_price),
+                    size=float(size),
+                    side=BUY if side_upper == "BUY" else SELL,
+                )
+                signed_order = client.create_order(order_args=order_args, options=options)
+            order_fields_for_api = _extract_signed_order_dict(signed_order)
+
+            for key in ("salt", "tokenId", "makerAmount", "takerAmount", "expiration", "timestamp"):
+                if key in order_fields_for_api and order_fields_for_api[key] is not None:
+                    order_fields_for_api[key] = str(order_fields_for_api[key])
+            for key in ("metadata", "builder"):
+                if key in order_fields_for_api and isinstance(order_fields_for_api[key], bytes):
+                    order_fields_for_api[key] = "0x" + order_fields_for_api[key].hex()
+
             signed_flow_payload = {
                 "marketId": market_id,
-                "signedOrder": {
-                    **order_fields_for_api,
-                    "signature": signature_hex,
-                },
+                "signedOrder": order_fields_for_api,
                 "orderType": order_type,
                 "userWalletAddress": wallet_address,
             }
-    except Exception as _exc:
-        # Fallback to simple flow below if signing fails
-        signed_flow_payload = None
-        import traceback
-        traceback.print_exc()
+        except Exception:
+            signed_flow_payload = None
+            import traceback
+            traceback.print_exc()
 
-    if signed_flow_payload is None:
-        print("Failed to build signed order payload. Aborting without sending.")
-        return
-    payload = signed_flow_payload
+        if signed_flow_payload is None:
+            if idx == len(signature_type_candidates) - 1:
+                print("Failed to build signed order payload. Aborting without sending.")
+                return
+            continue
 
-    try:
-        resp = requests.post(
-            f"{ALMANAC_API_URL}/v1/trading/orders",
-            headers=headers,
-            json=payload,
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            print("Failed to place order:")
-            try:
-                print(json.dumps(resp.json(), indent=2))
-            except Exception:
-                print(resp.text)
+        try:
+            resp = requests.post(
+                f"{ALMANAC_API_URL}/v1/trading/orders",
+                headers=headers,
+                json=signed_flow_payload,
+                timeout=30,
+            )
+            last_response = resp
+        except Exception as exc:
+            if idx == len(signature_type_candidates) - 1:
+                print(f"Order error: {exc}")
+                return
+            continue
+
+        if resp.status_code == 200:
+            print("Order placed:")
+            print(json.dumps(resp.json(), indent=2))
             return
-        print("Order placed:")
-        print(json.dumps(resp.json(), indent=2))
-    except Exception as exc:
-        print(f"Order error: {exc}")
+
+        # Some backends still verify proxy orders using signatureType=2; retry once.
+        should_retry_invalid_sig = False
+        try:
+            body = resp.json() or {}
+            details = body.get("details") if isinstance(body, dict) else {}
+            error_text = str((details or {}).get("error") or body.get("error") or "").lower()
+            should_retry_invalid_sig = "invalid signature" in error_text
+        except Exception:
+            should_retry_invalid_sig = False
+
+        if should_retry_invalid_sig and idx < len(signature_type_candidates) - 1:
+            continue
+
+        print("Failed to place order:")
+        try:
+            print(json.dumps(resp.json(), indent=2))
+        except Exception:
+            print(resp.text)
+        return
+
+    if last_response is not None:
+        print("Failed to place order:")
+        try:
+            print(json.dumps(last_response.json(), indent=2))
+        except Exception:
+            print(last_response.text)
 
 def search_markets():
     """
@@ -4517,7 +4768,7 @@ def generate_polymarket_credentials():
     # Create client and generate credentials
     client = ClobClient(host=POLYMARKET_CLOB_HOST, key=private_key, chain_id=POLYGON_CHAIN_ID)
     try:
-        credentials = client.create_or_derive_api_creds()
+        credentials = client.create_or_derive_api_key()
     except Exception as exc:
         print(f"Failed to create Polymarket API credentials: {exc}")
         return

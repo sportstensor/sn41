@@ -1,9 +1,9 @@
 requests
 dotenv
-py-clob-client
-bittensor
+py-clob-client-v2
+bittensor==9.12.2
+async-substrate-interface>=1.5.6,<2
 tabulate
 web3
 eth-account
 py-builder-relayer-client
-py-builder-signing-sdk

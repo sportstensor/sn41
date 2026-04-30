@@ -29,7 +29,7 @@ class Validator:
         self.setup_logging()
         self.setup_bittensor_objects()
         self.last_update = 0
-        self.scoring_minute = random.randint(5, 15)  # Run once per hour at this minute (UTC)
+        self.scoring_minute = random.randint(10, 25)  # Run once per hour at this minute (UTC)
         self.current_block = 0
         self.node = SubstrateInterface(url=self.config.subtensor.chain_endpoint)
         self.tempo = self.node_query('SubtensorModule', 'Tempo', [self.config.netuid])
@@ -280,74 +280,95 @@ class Validator:
 
             else:
                 bt.logging.info(f"Fetching trading history from {self.trading_history_endpoint} for {self.rolling_history_in_days} days")
-                
+
                 keypair = self.dendrite.keypair
                 hotkey = keypair.ss58_address
                 signature = f"0x{keypair.sign(hotkey).hex()}"
-                
-                # Function to fetch a single batch with offset
-                def _fetch_batch(offset: Optional[int] = None):
-                    url = f"{self.trading_history_endpoint}?days={self.rolling_history_in_days}&limit={self.trading_history_batch_limit}"
-                    if offset is not None:
-                        url += f"&offset={offset}"
-                    
+
+                def _cursor_is_blank(cursor: Optional[str]) -> bool:
+                    if cursor is None:
+                        return True
+                    if isinstance(cursor, str) and not cursor.strip():
+                        return True
+                    return False
+
+                # Fetch a single batch using cursor pagination.
+                # Returns (data_list, next_cursor_or_None).
+                def _fetch_batch(cursor: Optional[str] = None):
+                    params: Dict[str, object] = {
+                        "days": self.rolling_history_in_days,
+                        "limit": self.trading_history_batch_limit,
+                    }
+                    if not _cursor_is_blank(cursor):
+                        params["cursor"] = cursor
+
                     response = requests.get(
-                        url, 
+                        self.trading_history_endpoint,
+                        params=params,
                         auth=HTTPBasicAuth(hotkey, signature),
-                        timeout=20
+                        timeout=30,
                     )
                     response.raise_for_status()
                     api_response = response.json()
-                    
-                    # Validate response structure
+
                     if not isinstance(api_response, dict) or "data" not in api_response:
                         raise ValueError(f"Unexpected API response format: {type(api_response)}. Expected dict with 'data' field.")
-                    
+
+                    if api_response.get("success") is False:
+                        raise ValueError(f"API reported success=false: {api_response!r}")
+
                     trading_history_batch = api_response["data"]
                     if not isinstance(trading_history_batch, list):
                         raise ValueError(f"Expected 'data' field to be a list, got {type(trading_history_batch)}")
-                    
-                    # Extract pagination info
+
                     meta = api_response.get("meta", {})
-                    pagination = meta.get("pagination", {})
-                    has_more = pagination.get("has_more", False)
-                    next_offset = pagination.get("next_offset")
-                    
-                    return trading_history_batch, has_more, next_offset
-                
-                # Fetch all batches with pagination
-                all_trading_history = []
-                offset = None
+                    pagination = meta.get("pagination", {}) if isinstance(meta, dict) else {}
+                    next_cursor = pagination.get("next_cursor") if isinstance(pagination, dict) else None
+                    if next_cursor is not None and not isinstance(next_cursor, str):
+                        next_cursor = str(next_cursor)
+
+                    return trading_history_batch, next_cursor
+
+                all_trading_history: List[Dict] = []
+                cursor: Optional[str] = None
                 batch_num = 1
-                
+
                 while True:
-                    bt.logging.info(f"Fetching trading history batch {batch_num} (offset={offset})")
-                    
-                    # Fetch batch with retry logic
-                    trading_history_batch, has_more, next_offset = self._retry_with_backoff(_fetch_batch, offset)
-                    
-                    if not trading_history_batch:
-                        bt.logging.warning(f"Empty batch received at offset {offset}")
-                        break
-                    
-                    all_trading_history.extend(trading_history_batch)
-                    bt.logging.info(f"Batch {batch_num}: fetched {len(trading_history_batch)} trades (total so far: {len(all_trading_history)})")
-                    
-                    # Check if there are more pages
-                    if not has_more:
+                    cursor_log = "(initial)" if cursor is None else f"(cursor len={len(cursor)})"
+                    bt.logging.info(f"Fetching trading history batch {batch_num} {cursor_log}")
+
+                    trading_history_batch, next_cursor = self._retry_with_backoff(_fetch_batch, cursor)
+
+                    if trading_history_batch:
+                        all_trading_history.extend(trading_history_batch)
+                        bt.logging.info(
+                            f"Batch {batch_num}: fetched {len(trading_history_batch)} trades "
+                            f"(total so far: {len(all_trading_history)})"
+                        )
+                    else:
+                        bt.logging.warning(
+                            f"Empty data[] for batch {batch_num} {cursor_log} "
+                            f"(still honoring meta.pagination.next_cursor)"
+                        )
+
+                    # Terminate only when the server signals no next page.
+                    if _cursor_is_blank(next_cursor):
                         bt.logging.info(f"Finished fetching all trading history. Total trades: {len(all_trading_history)}")
                         break
-                    
-                    # Update offset for next batch
-                    if next_offset is None:
-                        bt.logging.warning("has_more is True but next_offset is None. Stopping pagination.")
+
+                    # Guard: if the API returns no rows AND echoes back the same cursor,
+                    # stop to avoid an infinite loop.
+                    if not trading_history_batch and cursor is not None and next_cursor == cursor:
+                        bt.logging.error(
+                            "Pagination stuck: empty data and next_cursor unchanged; stopping to avoid an infinite loop."
+                        )
                         break
-                    
-                    offset = next_offset
+
+                    cursor = next_cursor
                     batch_num += 1
-                
+
                 return all_trading_history
-        
+
         return self._retry_with_backoff(_fetch)
 
     def fetch_tao_price(self) -> float:
