@@ -54,7 +54,7 @@ import secrets
 import bittensor as bt
 from datetime import datetime
 from tabulate import tabulate
-from constants import VOLUME_FEE, PRICE_BUFFER_ADJUSTMENT
+from constants import VOLUME_FEE, PRICE_BUFFER_ADJUSTMENT, POLY_BUILDER_CODE
 from web3 import Web3
 from requests.compat import json as requests_json
 from py_builder_relayer_client.client import RelayClient
@@ -3980,6 +3980,21 @@ def _extract_signed_order_dict(signed_order) -> dict:
     return data
 
 
+def _resolve_builder_code() -> str:
+    """
+    Return a valid bytes32 builder code for attributed orders.
+    Falls back to zero-bytes if constant is not valid.
+    """
+    code = str(POLY_BUILDER_CODE or "").strip()
+    if code.startswith("0x") and len(code) == 66:
+        try:
+            int(code[2:], 16)
+            return code
+        except ValueError:
+            pass
+    return "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+
 def _normalize_sell_size_for_clob(size: float) -> float:
     """
     Polymarket-style orders encode sell `makerAmount` from round(size, 2) * 1e6.
@@ -4062,6 +4077,7 @@ def place_order(
     use_proxy_funder = bool(proxy_address and wallet_address and proxy_address.lower() != wallet_address.lower())
     signature_type_candidates = [1, 2] if use_proxy_funder else [None]
     last_response = None
+    builder_code = _resolve_builder_code()
 
     for idx, sig_type in enumerate(signature_type_candidates):
         signed_flow_payload = None
@@ -4103,6 +4119,7 @@ def place_order(
                     side=BUY if side_upper == "BUY" else SELL,
                     price=float(adjusted_price),
                     order_type=OrderType.FOK if order_type == "FOK" else OrderType.FAK,
+                    builder_code=builder_code,
                 )
                 signed_order = client.create_market_order(order_args=market_order_args, options=options)
             else:
@@ -4111,6 +4128,7 @@ def place_order(
                     price=float(adjusted_price),
                     size=float(size),
                     side=BUY if side_upper == "BUY" else SELL,
+                    builder_code=builder_code,
                 )
                 signed_order = client.create_order(order_args=order_args, options=options)
             order_fields_for_api = _extract_signed_order_dict(signed_order)
