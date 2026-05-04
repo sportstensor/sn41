@@ -7,6 +7,9 @@ VOLUME_FEE = 0.01
 # Price adjustment buffer for order placement
 PRICE_BUFFER_ADJUSTMENT = 0.01
 
+# Public Polymarket builder code (bytes32) used for order attribution.
+POLY_BUILDER_CODE = "0x196258757463baebc045d1adc1c9c0a55cad7ac5d09ab7b7e1eb31803d9bfbe0"
+
 ROI_MIN = 0.0
 VOLUME_MIN = 1
 VOLUME_DECAY = 0.9
