@@ -60,6 +60,14 @@ from constants import (
   RHO_CAP,
   KAPPA_NEXT,
   KAPPA_SCALING_FACTOR,
+  DUST_GATE,
+  ENABLE_PROTOCOL_CONTRIBUTOR,
+  RHO_VOLUME_BASIS,
+  ENABLE_P2_CREDIBILITY_WEIGHT,
+  ENABLE_P2_CRED_ON_POSITIVE_DELTA_ONLY,
+  PHASE2_ACTIVE_GATE_RETENTION,
+  PHASE2_ACTIVE_GATE_MIN_X1,
+  PHASE1_BUDGET_VOLUME_ALPHA,
   ENABLE_STATIC_WEIGHTING,
   GENERAL_POOL_WEIGHT_PERCENTAGE,
   MINER_WEIGHT_PERCENTAGE,
@@ -452,6 +460,42 @@ def check_build_up_eligibility(epoch_history: Dict[str, Any]) -> np.ndarray:
     
     return eligible
 
+def _constraint_dual_magnitude(constraint) -> float:
+    if hasattr(constraint, "dual_value") and constraint.dual_value is not None:
+        return float(np.max(np.abs(np.array(constraint.dual_value, dtype=float))))
+    return 0.0
+
+def _print_solver_dual_summary(phase_label: str, rows: list) -> None:
+    print(f"\n====================[ {phase_label} Dual Summary ]====================")
+    print(f"{'Constraint':35s} | {'Dual Magnitude':>15s}")
+    print("-" * 55)
+    for name, mag in rows:
+        marker = "⛔" if mag > 1e-6 else " "
+        print(f"{name:35s} | {mag:15.6f} {marker}")
+    print("=" * 55 + "\n")
+
+def print_dust_gate_diagnostics(sol1, sol2, dust_gate=DUST_GATE, verbose=False) -> None:
+    """Report how many eligible miners hold the dust gate through each phase."""
+    if not verbose or sol1 is None or sol1.get("x_star") is None:
+        return
+
+    x1 = sol1["x_star"]
+    num_eligible = int(sol1.get("num_eligible", 0))
+    phase1_at_dust = int(np.sum(x1 >= dust_gate - 1e-9))
+
+    if sol2 is not None and sol2.get("x_star") is not None:
+        x2 = sol2["x_star"]
+        phase2_at_dust = int(np.sum(x2 >= dust_gate - 1e-9))
+        lost_dust = int(np.sum((x1 >= dust_gate - 1e-9) & (x2 < dust_gate - 1e-9)))
+        print(
+            f"Dust gate ({dust_gate}): Phase1={phase1_at_dust}, "
+            f"Phase2={phase2_at_dust}, lost P1->P2={lost_dust} (eligible={num_eligible})"
+        )
+        if lost_dust > 0:
+            print(f"  WARNING: {lost_dust} eligible miners lost dust gate in Phase 2")
+    else:
+        print(f"Dust gate ({dust_gate}): Phase1={phase1_at_dust} (eligible={num_eligible})")
+
 def score_with_epochs(
     epoch_history: Dict[str, Any],
     budget: float,
@@ -590,7 +634,15 @@ def score_with_epochs(
         "kappa_bar": kappa_bar,                     # payout rate
         "ramp": RAMP,                               # allocation delta rate
         "rho_cap": RHO_CAP,                         # max allocation per miner
-        "require_epoch_preds": require_epoch_preds  # require current epoch predictions toggle
+        "dust_gate": DUST_GATE,                     # minimum gate for eligible traders
+        "require_epoch_preds": require_epoch_preds, # require current epoch predictions toggle
+        "protocol_contributor": ENABLE_PROTOCOL_CONTRIBUTOR,
+        "rho_volume_basis": RHO_VOLUME_BASIS,
+        "p2_credibility_weight": ENABLE_P2_CREDIBILITY_WEIGHT,
+        "p2_cred_on_positive_delta_only": ENABLE_P2_CRED_ON_POSITIVE_DELTA_ONLY,
+        "phase2_active_gate_retention": PHASE2_ACTIVE_GATE_RETENTION,
+        "phase2_active_gate_min_x1": PHASE2_ACTIVE_GATE_MIN_X1,
+        "phase1_budget_volume_alpha": PHASE1_BUDGET_VOLUME_ALPHA,
     }
     
     """
@@ -719,6 +771,7 @@ def score_with_epochs(
             f"Phase 1  ρ(ROI, x*) = {spearmanr(roi, sol1['x_star'])[0]},\n"
             f"Phase 2  ρ(ROI, x**) = {spearmanr(roi, sol2['x_star'])[0] if sol2 else 'n/a'},\n"
         )
+        print_dust_gate_diagnostics(sol1, sol2, dust_gate=p_dict.get("dust_gate", DUST_GATE), verbose=True)
     
     return {
         "entity_ids": entity_ids,
@@ -732,6 +785,49 @@ def score_with_epochs(
         "kappa_bar": kappa_bar
     }
 
+def _use_protocol_contributor(p) -> bool:
+    return bool(p.get("protocol_contributor", ENABLE_PROTOCOL_CONTRIBUTOR))
+
+def _phase1_routing_signal(p, v_block, roi_block) -> np.ndarray:
+    """Phase 1 objective: legacy routes epoch volume; protocol contributor routes profitable epoch flow."""
+    if _use_protocol_contributor(p):
+        return v_block * np.maximum(roi_block, 0.0)
+    return v_block
+
+def _diversity_volume(p, v_block, v_eff) -> np.ndarray:
+    """Volume basis for per-miner diversity cap."""
+    if _use_protocol_contributor(p):
+        basis = p.get("rho_volume_basis", RHO_VOLUME_BASIS)
+        if basis == "block":
+            return v_block
+    return v_eff
+
+def _phase1_budget_volume(p, v_block, v_eff) -> np.ndarray:
+    """Volume basis for Phase 1 budget constraint."""
+    if _use_protocol_contributor(p):
+        alpha = p.get("phase1_budget_volume_alpha", PHASE1_BUDGET_VOLUME_ALPHA)
+        return alpha * v_block + (1.0 - alpha) * v_eff
+    return v_eff
+
+def _credibility_weight(v_memory: np.ndarray) -> np.ndarray:
+    """Scale Phase 2 ROI weights by log historical volume relative to the pool median."""
+    positive = v_memory[v_memory > 0]
+    median = float(np.median(positive)) if positive.size else 1.0
+    return np.log1p(v_memory / max(median, 1e-12))
+
+def _epoch_active(v_block_raw: np.ndarray, v_min: float) -> np.ndarray:
+    """True when the miner traded at least v_min qualified volume this epoch."""
+    return v_block_raw >= v_min
+
+def _max_allocation_gate(p, v_block_raw: np.ndarray) -> np.ndarray:
+    """Per-miner gate ceiling; inactive epochs are dust-only under protocol contributor."""
+    n = v_block_raw.size
+    if _use_protocol_contributor(p):
+        dust_gate = p.get("dust_gate", DUST_GATE)
+        active = _epoch_active(v_block_raw, p["v_min"])
+        return np.where(active, 1.0, dust_gate)
+    return np.ones(n)
+
 def solve_phase1(p, verbose=False):
     """
     Phase 1: Maximize routed qualified volume given budget & payout constraints. 
@@ -739,8 +835,9 @@ def solve_phase1(p, verbose=False):
     #########################################
     ## Historical data and size
     #########################################
-    v_prev, v_eff ,v_block, roi_trailing, x_prev = p["v_prev"], p["v_eff"], p["v_block"], p["roi_trailing"], p["x_prev"]
-    n = v_block.size
+    v_prev, v_eff, v_block_raw, roi_trailing, x_prev = p["v_prev"], p["v_eff"], p["v_block"], p["roi_trailing"], p["x_prev"]
+    roi_block = p["roi_block"]
+    n = v_block_raw.size
     #########################################
     ## Numerical scaling
     ## First we have to make a scale so the 
@@ -749,13 +846,17 @@ def solve_phase1(p, verbose=False):
     #########################################
     B            = p["budget"]                   # budget size
     v_memory     = p.get("v_memory", v_prev)     # decaying volume
-    v_block      = np.maximum(v_block, 1e-12)    # block volume
+    v_block      = np.maximum(v_block_raw, 1e-12)    # block volume
     c            = v_eff*roi_trailing            # costs
     ## settings
     kappa        = p["kappa_bar"]                # dimensionless
     rho_cap      = p.get("rho_cap", RHO_CAP)     # diversity
     ramp         = p.get("ramp", RAMP)           # ramp
-   
+    dust_gate    = p.get("dust_gate", DUST_GATE) # minimum gate for eligible traders
+    max_gate     = _max_allocation_gate(p, v_block_raw)
+    routing      = _phase1_routing_signal(p, v_block, roi_block)
+    v_rho        = _diversity_volume(p, v_block, v_eff)
+    v_budget     = _phase1_budget_volume(p, v_block, v_eff)
     #########################################
     ## Eligibility Gates
     ## We then have to generate a cost per units
@@ -798,62 +899,41 @@ def solve_phase1(p, verbose=False):
     eps = 1e-9
     cons = []
     cons += [x >= 0, x <= 1]                                         # gates
-    cons += [kappa * (v_eff @ x) <= B]                               # budget
+    cons += [kappa * (v_budget @ x) <= B]                            # budget
     cons += [x <= eligible]                                          # eligibility
-    cons += [kappa * v_eff[i] * x[i] <= rho_cap*B for i in range(n)] # diversity
+    cons += [x <= max_gate]                                          # inactive epochs: dust only (PC)
+    diversity_start = len(cons)
+    cons += [kappa * v_rho[i] * x[i] <= rho_cap*B for i in range(n)] # diversity
+    cons += [x >= dust_gate * eligible]                              # dust constraint
     
     #TODO: these might no longer be needed at all.
     #cons += [c @ x <= kappa * (v_eff @ x + eps)]            # payout/volume cap
     #cons += [x - x_prev <= ramp, x_prev - x <= ramp]        # ramp
-    #cons += [x >= 1e-2*eligible]                            # dust constraint
     #cons += [c[i] * x[i] <= rho_cap * B for i in range(n)]  # diversity cap    
    
     # 5) Objective
-    prob = cp.Problem(cp.Maximize(v_block@x), cons)
+    prob = cp.Problem(cp.Maximize(routing @ x), cons)
     prob.solve(solver=cp.ECOS, verbose=False)
 
     # 6) === Dual diagnostics table ===
     if prob.status in ("optimal", "optimal_inaccurate"):
         if verbose:
-            print("\n====================[ Phase 1 Dual Summary ]====================")
-
-            labels = [
-                ("x >= 0",            cons[0]),
-                ("x <= 1",            cons[1]),
-                ("budget cap",        cons[2]),
-                ("x <= eligible",     cons[3]),
+            rows = [
+                ("x >= 0", _constraint_dual_magnitude(cons[0])),
+                ("x <= 1", _constraint_dual_magnitude(cons[1])),
+                ("budget cap", _constraint_dual_magnitude(cons[2])),
+                ("x <= eligible", _constraint_dual_magnitude(cons[3])),
             ]
-
-            # Diversity group (vector of n)
-            diversity_cons = cons[4:]
-
-            rows = []
-            for name, cstr in labels:
-                if hasattr(cstr, "dual_value") and cstr.dual_value is not None:
-                    duals = np.array(cstr.dual_value, dtype=float)
-                    mag = np.max(np.abs(duals))
-                    rows.append((name, mag))
-                else:
-                    rows.append((name, 0.0))
-
-            # Handle diversity separately
-            mags = []
-            for c in diversity_cons:
-                if hasattr(c, "dual_value") and c.dual_value is not None:
-                    mags.append(np.max(np.abs(np.array(c.dual_value, dtype=float))))
-            rows.append(("diversity (all)", float(np.max(mags)) if mags else 0.0))
-
-            # Pretty print summary
-            print(f"{'Constraint':35s} | {'Dual Magnitude':>15s}")
-            print("-" * 55)
-            for name, mag in rows:
-                marker = "⛔" if mag > 1e-6 else " "
-                print(f"{name:35s} | {mag:15.6f} {marker}")
-            print("=" * 55 + "\n")
+            diversity_mags = [
+                _constraint_dual_magnitude(c) for c in cons[diversity_start:diversity_start + n]
+            ]
+            rows.append(("diversity (all)", float(np.max(diversity_mags)) if diversity_mags else 0.0))
+            rows.append(("dust gate", _constraint_dual_magnitude(cons[diversity_start + n])))
+            _print_solver_dual_summary("Phase 1", rows)
 
         # 6) Return
         x_star = None if x.value is None else x.value.copy()
-        T_star = float(v_block @ x_star) if x_star is not None else 0.0
+        T_star = float(routing @ x_star) if x_star is not None else 0.0
         
         payout = float(np.dot(v_block * np.maximum(roi_trailing, 0.0), x_star)) if x_star is not None else 0.0
         num_funded = int(np.sum((v_block * np.maximum(roi_trailing, 0.0) * x_star) > 0)) if x_star is not None else 0
@@ -873,13 +953,17 @@ def solve_phase2(p, x1, T1, verbose=False):
     Phase 2: Redistribute fixed payout to favor higher ROI while staying
     close to x1 (Phase 1 gates).
     """
-    v            = p["v_block"]
-    n            = v.size
+    v_raw        = p["v_block"]
+    n            = v_raw.size
+    v            = np.maximum(v_raw, 1e-12)
     v_eff        = p["v_eff"]
+    v_memory     = p.get("v_memory", v_eff)
     roi          = p["roi_trailing"]
     B            = p["budget"]
     max_budget = p.get("max_budget_weighted", B) if p.get("max_budget_weighted") is not None else B # default max_budget to budget if not provided
     kappa        = p["kappa_bar"]
+    dust_gate    = p.get("dust_gate", DUST_GATE)
+    max_gate     = _max_allocation_gate(p, v_raw)
 
     # Token cost per miner if fully opened
     c = kappa * v_eff
@@ -918,6 +1002,12 @@ def solve_phase2(p, x1, T1, verbose=False):
 
     # weight positive deltas (above kappa) more, negative ones less
     w = delta
+    if _use_protocol_contributor(p) and p.get("p2_credibility_weight", ENABLE_P2_CREDIBILITY_WEIGHT):
+        cred = _credibility_weight(v_memory)
+        if p.get("p2_cred_on_positive_delta_only", ENABLE_P2_CRED_ON_POSITIVE_DELTA_ONLY):
+            w = np.where(delta > 0, delta * cred, delta)
+        else:
+            w = w * cred
 
     # Decision variable
     x = cp.Variable(n)
@@ -926,14 +1016,20 @@ def solve_phase2(p, x1, T1, verbose=False):
     cons = []
     cons += [x >= 0, x <= 1]
     cons += [x <= eligible]                 # eligibility
+    cons += [x <= max_gate]                   # inactive epochs: dust only (PC)
     cons += [c @ x <= min(P1, B, max_budget)] # fixed total payout (ensured not greater than budget or max budget weighted)
+    cons += [x >= dust_gate * eligible]     # dust constraint (mirror Phase 1)
+    if _use_protocol_contributor(p):
+        retention = p.get("phase2_active_gate_retention", PHASE2_ACTIVE_GATE_RETENTION)
+        min_x1 = p.get("phase2_active_gate_min_x1", PHASE2_ACTIVE_GATE_MIN_X1)
+        if retention > 0:
+            active = _epoch_active(v_raw, p["v_min"])
+            for i in range(n):
+                if active[i] and x1[i] > max(dust_gate, min_x1):
+                    cons += [x[i] >= x1[i] * retention]
 
     # Objective: favor ROI while staying close to prior gates
-    # dynamic smoothness penalty λ
-    roi_spread = np.std(p["roi_trailing"])
-    vol_mean   = np.mean(p["v_eff"])
-
-    # dynamic smoothness penalty λ. higher value means more smoothness, less volatility.
+    # dynamic smoothness penalty λ. higher value = stay closer to Phase 1 gates.
     lam = 5
 
     if verbose:
@@ -943,6 +1039,16 @@ def solve_phase2(p, x1, T1, verbose=False):
 
     prob = cp.Problem(obj, cons)
     prob.solve(solver=cp.ECOS, verbose=False)
+
+    if prob.status in ("optimal", "optimal_inaccurate") and verbose:
+        rows = [
+            ("x >= 0", _constraint_dual_magnitude(cons[0])),
+            ("x <= 1", _constraint_dual_magnitude(cons[1])),
+            ("x <= eligible", _constraint_dual_magnitude(cons[2])),
+            ("budget cap", _constraint_dual_magnitude(cons[3])),
+            ("dust gate", _constraint_dual_magnitude(cons[4])),
+        ]
+        _print_solver_dual_summary("Phase 2", rows)
 
     if x.value is not None:
         dx = x.value - x1

@@ -24,8 +24,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import bittensor as bt
 
-from scoring import score_miners, calculate_weights, print_pool_stats
-from constants import MINER_WEIGHT_PERCENTAGE, GENERAL_POOL_WEIGHT_PERCENTAGE, ROLLING_HISTORY_IN_DAYS, KAPPA_NEXT, TOTAL_MINER_ALPHA_PER_DAY, EXCESS_MINER_WEIGHT_UID, BURN_UID
+from scoring import score_miners, calculate_weights, print_pool_stats, print_dust_gate_diagnostics
+from constants import MINER_WEIGHT_PERCENTAGE, GENERAL_POOL_WEIGHT_PERCENTAGE, ROLLING_HISTORY_IN_DAYS, KAPPA_NEXT, TOTAL_MINER_ALPHA_PER_DAY, EXCESS_MINER_WEIGHT_UID, BURN_UID, DUST_GATE
 
 
 def load_mock_data(filepath="tests/mock_trading_data.json"):
@@ -414,6 +414,29 @@ def print_results(miner_history, general_pool_history, miners_scores, general_po
     if miners_scores['sol2']:
         print(f"Phase 2 Status:           {miners_scores['sol2']['status']}")
         print(f"Phase 2 Payout:           ${miners_scores['sol2']['payout']:,.2f}")
+
+    print("\n--- DUST GATE DIAGNOSTICS ---")
+    print(f"Dust gate constant:       {DUST_GATE}")
+    print_dust_gate_diagnostics(
+        miners_scores.get('sol1'),
+        miners_scores.get('sol2'),
+        dust_gate=DUST_GATE,
+        verbose=True,
+    )
+    if miners_scores.get('sol1') and miners_scores.get('sol2') and miners_scores['sol1'].get('x_star') is not None and miners_scores['sol2'].get('x_star') is not None:
+        x1 = miners_scores['sol1']['x_star']
+        x2 = miners_scores['sol2']['x_star']
+        tokens = miners_scores['tokens']
+        entity_ids = miners_scores['entity_ids']
+        at_dust = x2 >= DUST_GATE - 1e-9
+        with_tokens = tokens >= 0.01
+        print(f"Miners at dust gate after Phase 2: {int(np.sum(at_dust))}")
+        print(f"Miners with tokens >= $0.01:      {int(np.sum(with_tokens))}")
+        lost = (x1 >= DUST_GATE - 1e-9) & (x2 < DUST_GATE - 1e-9)
+        if np.any(lost):
+            print("Miners who lost dust gate in Phase 2:")
+            for idx in np.where(lost)[0]:
+                print(f"  PID {entity_ids[idx]}: x1={x1[idx]:.4f} -> x2={x2[idx]:.6f}")
     
     # Top miners
     if len(miners_scores['scores']) > 0:
@@ -614,3 +637,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+    print("Simulation complete. Exiting...")
+    # os._exit bypasses normal shutdown (needed: bittensor leaves threads that
+    # would otherwise hang), but it also skips flushing stdout. When output is
+    # redirected to a file, the buffer is block-sized and the tail is lost.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
