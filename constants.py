@@ -12,11 +12,29 @@ POLY_BUILDER_CODE = "0x196258757463baebc045d1adc1c9c0a55cad7ac5d09ab7b7e1eb31803
 
 ROI_MIN = 0.0
 VOLUME_MIN = 1
-VOLUME_DECAY = 0.9
+VOLUME_DECAY = 0.85
 RAMP = 0.1 # originally 0.1
-RHO_CAP = 0.1 # originally 0.1
+RHO_CAP = 0.05 # originally 0.1
 KAPPA_NEXT = 0.03 # originally 0.02
-KAPPA_SCALING_FACTOR = 1 # originally 6
+KAPPA_SCALING_FACTOR = 8 # originally 6; raised to 8 to fund more active high-volume contributors past the Phase 1 ROI cliff
+# Minimum allocation gate (x) for eligible traders in both optimizer phases.
+DUST_GATE = 0.01
+
+# Protocol Contributor scoring: route profitable epoch flow, cap diversity on epoch volume,
+# and weight Phase 2 redistribution by historical volume credibility.
+ENABLE_PROTOCOL_CONTRIBUTOR = True
+# Diversity cap volume basis when protocol contributor is on: "block" (epoch) or "eff" (legacy).
+RHO_VOLUME_BASIS = "block"
+# Phase 2: multiply ROI weights by log(1 + v_memory) to favor long-term fee contributors.
+ENABLE_P2_CREDIBILITY_WEIGHT = True
+# Phase 2: apply credibility only when roi > kappa (don't amplify below-kappa penalties).
+ENABLE_P2_CRED_ON_POSITIVE_DELTA_ONLY = True
+# Phase 2: epoch-active miners retain at least this fraction of their Phase 1 gate (0=off).
+PHASE2_ACTIVE_GATE_RETENTION = 0.4
+# Only apply retention when Phase 1 opened a meaningful gate (above dust).
+PHASE2_ACTIVE_GATE_MIN_X1 = 0.02
+# Phase 1 budget volume blend when protocol contributor is on: 0=v_eff (legacy), 1=v_block.
+PHASE1_BUDGET_VOLUME_ALPHA = 1.0
 
 # Build-up period constants for miner eligibility
 MIN_EPOCHS_FOR_ELIGIBILITY = 3  # Must trade for X epochs
@@ -37,7 +55,7 @@ MAX_EPOCH_BUDGET_PERCENTAGE_FOR_BOOST = .25
 MINER_POOL_BUDGET_BOOST_PERCENTAGE = 0
 
 # Early stage incentive parameters for the miner pool
-ENABLE_ES_MINER_INCENTIVES = True
+ENABLE_ES_MINER_INCENTIVES = False
 # This is the multiplier of the trader's fees paid that is given to the miner if they have positive tokens (score). 1.2 == 120%.
 ESM_MIN_MULTIPLIER = 1.2
 # If ENABLE_ES_MINER_LOSS_COMPENSATION is True, we will give back the trader's fees paid to the miner if they have positive epoch profit but no score.
@@ -46,7 +64,7 @@ ENABLE_ES_MINER_LOSS_COMPENSATION = True
 ESM_LOSS_COMPENSATION_PERCENTAGE = 1.0
 
 # Early stage incentive parameters for the general pool
-ENABLE_ES_GP_INCENTIVES = True
+ENABLE_ES_GP_INCENTIVES = False
 # This is the multiplier of the trader's fees paid that is given to the gp trader if they have positive tokens (score). 1.2 == 120%.
 ESGP_MIN_MULTIPLIER = 1.2
 # If ENABLE_ES_GP_LOSS_COMPENSATION is True, we will give back the trader's fees paid to the gp trader if they have positive epoch profit but no score.
@@ -56,7 +74,7 @@ ESGP_LOSS_COMPENSATION_PERCENTAGE = 1.0
 
 # This is used to give more weights (and in turn, more incentives) to the miners by taking the final miner pool weights and boosting them by this percentage.
 # Set to 0 to disable.
-MINER_POOL_WEIGHT_BOOST_PERCENTAGE = 0
+MINER_POOL_WEIGHT_BOOST_PERCENTAGE = 0.5
 
 TOTAL_MINER_ALPHA_PER_DAY = 2952 # 7200 alpha per day for entire subnet * 0.41 (41% for miners)
 
