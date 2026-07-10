@@ -35,6 +35,11 @@ PHASE2_ACTIVE_GATE_RETENTION = 0.4
 PHASE2_ACTIVE_GATE_MIN_X1 = 0.02
 # Phase 1 budget volume blend when protocol contributor is on: 0=v_eff (legacy), 1=v_block.
 PHASE1_BUDGET_VOLUME_ALPHA = 1.0
+# Phase 2: price gates on the Phase 1 budget volume basis (v_block when alpha=1) instead of
+# v_eff, so the Phase 2 budget cap matches Phase 1's commitment. Without this, high-history
+# miners (large v_eff) make Phase 2 cost far exceed the fee budget, forcing the optimizer to
+# crush active contributors' gates to dust (and, with retention floors, go infeasible).
+ENABLE_P2_ALIGNED_COST_BASIS = False
 
 # Build-up period constants for miner eligibility
 MIN_EPOCHS_FOR_ELIGIBILITY = 3  # Must trade for X epochs
