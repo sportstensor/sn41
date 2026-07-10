@@ -68,6 +68,7 @@ from constants import (
   PHASE2_ACTIVE_GATE_RETENTION,
   PHASE2_ACTIVE_GATE_MIN_X1,
   PHASE1_BUDGET_VOLUME_ALPHA,
+  ENABLE_P2_ALIGNED_COST_BASIS,
   ENABLE_STATIC_WEIGHTING,
   GENERAL_POOL_WEIGHT_PERCENTAGE,
   MINER_WEIGHT_PERCENTAGE,
@@ -643,6 +644,7 @@ def score_with_epochs(
         "phase2_active_gate_retention": PHASE2_ACTIVE_GATE_RETENTION,
         "phase2_active_gate_min_x1": PHASE2_ACTIVE_GATE_MIN_X1,
         "phase1_budget_volume_alpha": PHASE1_BUDGET_VOLUME_ALPHA,
+        "p2_aligned_cost_basis": ENABLE_P2_ALIGNED_COST_BASIS,
     }
     
     """
@@ -690,10 +692,17 @@ def score_with_epochs(
     The notion here is use the final optimization values to sum up the scores
     of those miners that actually added signal while scoring the 
     """
-    if sol2 is not None:
-        x_star = np.array(sol2.get("x_star", np.zeros_like(x_prev)))
-        c_star = np.array(sol2.get("c_star", np.zeros_like(x_prev)))
-    else:
+    # Prefer the Phase 2 allocation; fall back to Phase 1 gates if Phase 2 produced no
+    # solution (e.g. solver infeasibility), and only zero out as a last resort.
+    x_star = None
+    c_star = None
+    if sol2 is not None and sol2.get("x_star") is not None:
+        x_star = np.array(sol2["x_star"])
+        c_star = np.array(sol2["c_star"])
+    elif sol1 is not None and sol1.get("x_star") is not None:
+        x_star = np.clip(np.array(sol1["x_star"]), 0.0, 1.0)
+        c_star = p_dict["kappa_bar"] * p_dict["v_eff"]
+    if x_star is None or c_star is None:
         x_star = np.zeros_like(x_prev)
         c_star = np.zeros_like(x_prev)
 
@@ -965,8 +974,13 @@ def solve_phase2(p, x1, T1, verbose=False):
     dust_gate    = p.get("dust_gate", DUST_GATE)
     max_gate     = _max_allocation_gate(p, v_raw)
 
-    # Token cost per miner if fully opened
-    c = kappa * v_eff
+    # Token cost per miner if fully opened. Under protocol contributor, align the cost basis
+    # with Phase 1's budget volume (v_block when alpha=1) so the Phase 2 budget cap matches
+    # what Phase 1 committed. With the legacy v_eff basis, high-history miners inflate the
+    # Phase 2 cost far past the fee budget, forcing gates to be crushed to dust.
+    aligned_cost = _use_protocol_contributor(p) and p.get("p2_aligned_cost_basis", ENABLE_P2_ALIGNED_COST_BASIS)
+    v_cost = _phase1_budget_volume(p, v, v_eff) if aligned_cost else v_eff
+    c = kappa * v_cost
 
     ##eligibility
     # Get build-up eligibility from the epoch history
@@ -1012,13 +1026,22 @@ def solve_phase2(p, x1, T1, verbose=False):
     # Decision variable
     x = cp.Variable(n)
 
-    # Constraints
-    cons = []
-    cons += [x >= 0, x <= 1]
-    cons += [x <= eligible]                 # eligibility
-    cons += [x <= max_gate]                   # inactive epochs: dust only (PC)
-    cons += [c @ x <= min(P1, B, max_budget)] # fixed total payout (ensured not greater than budget or max budget weighted)
-    cons += [x >= dust_gate * eligible]     # dust constraint (mirror Phase 1)
+    # Budget cap: with the aligned cost basis, Phase 1 already fits within B, so cap on the
+    # real budget to keep full utilization. Legacy keeps the P1-committed cap.
+    budget_cap = min(B, max_budget) if aligned_cost else min(P1, B, max_budget)
+
+    # Base constraints (always mutually feasible: dust floor sits under the budget cap)
+    base_cons = []
+    base_cons += [x >= 0, x <= 1]
+    base_cons += [x <= eligible]                 # eligibility
+    base_cons += [x <= max_gate]                   # inactive epochs: dust only (PC)
+    base_cons += [c @ x <= budget_cap]           # fixed total payout (not greater than budget)
+    base_cons += [x >= dust_gate * eligible]     # dust constraint (mirror Phase 1)
+
+    # Optional retention floor: keep active contributors near their Phase 1 gates. Added
+    # separately so it can be dropped if it ever makes Phase 2 infeasible (belt-and-suspenders;
+    # the aligned cost basis normally keeps these feasible).
+    retention_cons = []
     if _use_protocol_contributor(p):
         retention = p.get("phase2_active_gate_retention", PHASE2_ACTIVE_GATE_RETENTION)
         min_x1 = p.get("phase2_active_gate_min_x1", PHASE2_ACTIVE_GATE_MIN_X1)
@@ -1026,7 +1049,7 @@ def solve_phase2(p, x1, T1, verbose=False):
             active = _epoch_active(v_raw, p["v_min"])
             for i in range(n):
                 if active[i] and x1[i] > max(dust_gate, min_x1):
-                    cons += [x[i] >= x1[i] * retention]
+                    retention_cons += [x[i] >= x1[i] * retention]
 
     # Objective: favor ROI while staying close to prior gates
     # dynamic smoothness penalty λ. higher value = stay closer to Phase 1 gates.
@@ -1037,8 +1060,18 @@ def solve_phase2(p, x1, T1, verbose=False):
 
     obj = cp.Maximize(w @ x -  lam * cp.sum_squares(x - x1))
 
+    cons = base_cons + retention_cons
     prob = cp.Problem(obj, cons)
     prob.solve(solver=cp.ECOS, verbose=False)
+
+    # Graceful degradation: if retention floors made the problem infeasible, re-solve on the
+    # base constraints rather than returning an empty (None) solution that would crash scoring.
+    if (prob.status not in ("optimal", "optimal_inaccurate") or x.value is None) and retention_cons:
+        if verbose:
+            print(f"Phase 2 infeasible with retention floors (status={prob.status}); retrying without them.")
+        cons = base_cons
+        prob = cp.Problem(obj, cons)
+        prob.solve(solver=cp.ECOS, verbose=False)
 
     if prob.status in ("optimal", "optimal_inaccurate") and verbose:
         rows = [
@@ -1063,7 +1096,7 @@ def solve_phase2(p, x1, T1, verbose=False):
         "status": prob.status,
         "x_star": None if x.value is None else x.value.copy(),
         "c_star": c,
-        "payout": min(P1, B, max_budget), # ensure payout is not greater than budget or max budget weighted
+        "payout": budget_cap, # total distributed (not greater than budget or max budget weighted)
     }
 
 """
