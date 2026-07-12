@@ -60,6 +60,7 @@ from constants import (
   RHO_CAP,
   KAPPA_NEXT,
   KAPPA_SCALING_FACTOR,
+  KAPPA_NEXT_IS_FINAL_BAR,
   DUST_GATE,
   ENABLE_PROTOCOL_CONTRIBUTOR,
   RHO_VOLUME_BASIS,
@@ -68,6 +69,8 @@ from constants import (
   PHASE2_ACTIVE_GATE_RETENTION,
   PHASE2_ACTIVE_GATE_MIN_X1,
   PHASE1_BUDGET_VOLUME_ALPHA,
+  ENABLE_P1_ENTROPY_SMOOTHING,
+  SOFTNESS_TAU,
   ENABLE_P2_ALIGNED_COST_BASIS,
   ENABLE_STATIC_WEIGHTING,
   GENERAL_POOL_WEIGHT_PERCENTAGE,
@@ -475,6 +478,18 @@ def _print_solver_dual_summary(phase_label: str, rows: list) -> None:
         print(f"{name:35s} | {mag:15.6f} {marker}")
     print("=" * 55 + "\n")
 
+def _safe_spearman(a: np.ndarray, b: np.ndarray) -> float:
+    """Spearman correlation that never raises on short/degenerate inputs."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    n = min(a.size, b.size)
+    if n < 2:
+        return float("nan")
+    try:
+        return float(spearmanr(a[:n], b[:n])[0])
+    except ValueError:
+        return float("nan")
+
 def print_dust_gate_diagnostics(sol1, sol2, dust_gate=DUST_GATE, verbose=False) -> None:
     """Report how many eligible miners hold the dust gate through each phase."""
     if not verbose or sol1 is None or sol1.get("x_star") is None:
@@ -644,6 +659,8 @@ def score_with_epochs(
         "phase2_active_gate_retention": PHASE2_ACTIVE_GATE_RETENTION,
         "phase2_active_gate_min_x1": PHASE2_ACTIVE_GATE_MIN_X1,
         "phase1_budget_volume_alpha": PHASE1_BUDGET_VOLUME_ALPHA,
+        "enable_p1_entropy_smoothing": ENABLE_P1_ENTROPY_SMOOTHING,
+        "softness_tau": SOFTNESS_TAU,
         "p2_aligned_cost_basis": ENABLE_P2_ALIGNED_COST_BASIS,
     }
     
@@ -749,6 +766,8 @@ def score_with_epochs(
     # Historical (all epochs so far)
     total_unqualified = np.sum(unqualified_prev_matrix)
     total_qualified = np.sum(qualified_prev_matrix)
+    phase1_corr = _safe_spearman(roi, sol1["x_star"])
+    phase2_corr = _safe_spearman(roi, sol2["x_star"]) if (sol2 and sol2.get("x_star") is not None) else float("nan")
     
     if verbose:
         print(
@@ -777,8 +796,8 @@ def score_with_epochs(
             f"###########################################\n"
             f"status      = {sol2['status'] if sol2 else 'n/a'},\n"
             f"Payout*     = {sol2['payout'] if sol2 else 0.0:.2f},\n"
-            f"Phase 1  ρ(ROI, x*) = {spearmanr(roi, sol1['x_star'])[0]},\n"
-            f"Phase 2  ρ(ROI, x**) = {spearmanr(roi, sol2['x_star'])[0] if sol2 else 'n/a'},\n"
+            f"Phase 1  ρ(ROI, x*) = {phase1_corr},\n"
+            f"Phase 2  ρ(ROI, x**) = {phase2_corr},\n"
         )
         print_dust_gate_diagnostics(sol1, sol2, dust_gate=p_dict.get("dust_gate", DUST_GATE), verbose=True)
     
@@ -921,7 +940,14 @@ def solve_phase1(p, verbose=False):
     #cons += [c[i] * x[i] <= rho_cap * B for i in range(n)]  # diversity cap    
    
     # 5) Objective
-    prob = cp.Problem(cp.Maximize(routing @ x), cons)
+    # Optional entropy smoothing (Proposal 2): softens the hard ROI cliff while keeping
+    # the same budget/diversity constraints. Disabled by default for no behavior change.
+    use_entropy = _use_protocol_contributor(p) and p.get("enable_p1_entropy_smoothing", ENABLE_P1_ENTROPY_SMOOTHING)
+    tau = float(p.get("softness_tau", SOFTNESS_TAU))
+    obj_expr = routing @ x
+    if use_entropy and tau > 0:
+        obj_expr = obj_expr + tau * (v_budget @ cp.entr(x))
+    prob = cp.Problem(cp.Maximize(obj_expr), cons)
     prob.solve(solver=cp.ECOS, verbose=False)
 
     # 6) === Dual diagnostics table ===
@@ -1085,11 +1111,11 @@ def solve_phase2(p, x1, T1, verbose=False):
 
     if x.value is not None:
         dx = x.value - x1
-        s1 = spearmanr(roi, x1)[0]
-        s2 = spearmanr(roi, x.value)[0]
+        s1 = _safe_spearman(roi, x1)
+        s2 = _safe_spearman(roi, x.value)
         if verbose:
             print("Δx mean:", float(np.mean(np.abs(dx))))
-            print("Spearman Δ:", float(s2 - s1))
+            print("Spearman Δ:", float(s2 - s1) if np.isfinite(s1) and np.isfinite(s2) else float("nan"))
             print("ρ(ROI, x**):", float(s2))
 
     return {
@@ -1106,7 +1132,15 @@ Purpose: Computes the value of kappa as an endogenous variable that depends
             on previous volume and roi.  The goal is to restrict the payout rate
             of the budget by setting the “exchange rate” between qualified flow and token budget.
 """
-def compute_joint_kappa_from_history(epoch_history: Dict[str, Any], lookback=ROLLING_HISTORY_IN_DAYS, smooth=0.3, fee_rate=VOLUME_FEE, kappa_next=KAPPA_NEXT, joint_kappa=None) -> float:
+def compute_joint_kappa_from_history(
+    epoch_history: Dict[str, Any],
+    lookback=ROLLING_HISTORY_IN_DAYS,
+    smooth=0.3,
+    fee_rate=VOLUME_FEE,
+    kappa_next=KAPPA_NEXT,
+    joint_kappa=None,
+    kappa_next_is_final_bar=KAPPA_NEXT_IS_FINAL_BAR,
+) -> float:
     """
     Compute kappa_bar from epoch history matrices.
     
@@ -1118,7 +1152,10 @@ def compute_joint_kappa_from_history(epoch_history: Dict[str, Any], lookback=ROL
     v_prev = epoch_history["qualified_prev"]
     profit_prev = epoch_history["profit_prev"]
     
-    prev_kappa = kappa_next
+    # Explicit fallback policy:
+    # - final-bar mode preserves current behavior (KAPPA_NEXT is already the final κ̄)
+    # - pre-scaled mode divides by KAPPA_SCALING_FACTOR for consistency with normal path
+    prev_kappa = kappa_next if kappa_next_is_final_bar else (kappa_next / KAPPA_SCALING_FACTOR)
     if v_prev.shape[0] < 5:
         return prev_kappa
 

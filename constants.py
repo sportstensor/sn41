@@ -14,11 +14,15 @@ ROI_MIN = 0.0
 VOLUME_MIN = 1
 VOLUME_DECAY = 0.85
 RAMP = 0.1 # originally 0.1
-RHO_CAP = 0.05 # originally 0.1
+RHO_CAP = 0.06 # originally 0.1
 KAPPA_NEXT = 0.03 # originally 0.02
 KAPPA_SCALING_FACTOR = 8 # originally 6; raised to 8 to fund more active high-volume contributors past the Phase 1 ROI cliff
+# Fallback interpretation for kappa_bar when history is insufficient.
+# True: treat KAPPA_NEXT as already-final kappa_bar (preserves current behavior).
+# False: treat KAPPA_NEXT as pre-scaled and divide by KAPPA_SCALING_FACTOR.
+KAPPA_NEXT_IS_FINAL_BAR = True
 # Minimum allocation gate (x) for eligible traders in both optimizer phases.
-DUST_GATE = 0.01
+DUST_GATE = 0.001
 
 # Protocol Contributor scoring: route profitable epoch flow, cap diversity on epoch volume,
 # and weight Phase 2 redistribution by historical volume credibility.
@@ -26,15 +30,22 @@ ENABLE_PROTOCOL_CONTRIBUTOR = True
 # Diversity cap volume basis when protocol contributor is on: "block" (epoch) or "eff" (legacy).
 RHO_VOLUME_BASIS = "block"
 # Phase 2: multiply ROI weights by log(1 + v_memory) to favor long-term fee contributors.
-ENABLE_P2_CREDIBILITY_WEIGHT = True
+ENABLE_P2_CREDIBILITY_WEIGHT = False
 # Phase 2: apply credibility only when roi > kappa (don't amplify below-kappa penalties).
 ENABLE_P2_CRED_ON_POSITIVE_DELTA_ONLY = True
 # Phase 2: epoch-active miners retain at least this fraction of their Phase 1 gate (0=off).
-PHASE2_ACTIVE_GATE_RETENTION = 0.4
+# Higher = keep more of the Phase 1 gate, less redistribution. Lower = more redistribution, phase 2 can reallocate more.
+PHASE2_ACTIVE_GATE_RETENTION = 0.1
 # Only apply retention when Phase 1 opened a meaningful gate (above dust).
-PHASE2_ACTIVE_GATE_MIN_X1 = 0.02
+PHASE2_ACTIVE_GATE_MIN_X1 = 0.08
 # Phase 1 budget volume blend when protocol contributor is on: 0=v_eff (legacy), 1=v_block.
-PHASE1_BUDGET_VOLUME_ALPHA = 1.0
+PHASE1_BUDGET_VOLUME_ALPHA = 0.55
+# Phase 1: optional entropy smoothing for the knapsack objective (Proposal 2).
+# Keep disabled by default for no behavior change; set true to enable.
+ENABLE_P1_ENTROPY_SMOOTHING = True
+# Entropy strength (tau) used when ENABLE_P1_ENTROPY_SMOOTHING=True.
+# ~0.01-0.02 materially softens cliff behavior in recent production sims.
+SOFTNESS_TAU = 0.015
 # Phase 2: price gates on the Phase 1 budget volume basis (v_block when alpha=1) instead of
 # v_eff, so the Phase 2 budget cap matches Phase 1's commitment. Without this, high-history
 # miners (large v_eff) make Phase 2 cost far exceed the fee budget, forcing the optimizer to
