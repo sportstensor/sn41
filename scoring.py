@@ -1512,11 +1512,12 @@ def apply_miner_positive_score_fee_floor(
     miner_pool_epoch_budget: float
 ) -> Dict[str, Any]:
     """
-    Ensure winning miners with positive scores receive a minimum fee-return floor.
+    Ensure eligible current-epoch losers with positive history receive a fee-return floor.
 
-    This applies only when both of the following are true:
-    - Miner has positive score/tokens for the epoch
-    - Miner has positive current-epoch profit (won the epoch)
+    This applies only when all of the following are true:
+    - Miner has negative current-epoch profit (lost this epoch)
+    - Miner has positive historical PnL before this epoch
+    - Miner has positive historical ROI before this epoch
     It is independent of early-stage incentives. Tokens are adjusted in-place; if the floor
     pushes total miner tokens above miner pool budget, tokens are proportionally scaled to
     remain budget-safe.
@@ -1528,21 +1529,25 @@ def apply_miner_positive_score_fee_floor(
         return miners_scores
 
     fees_prev_matrix = miner_history["fees_prev"]
+    volume_prev_matrix = miner_history["volume_prev"]
     profit_prev_matrix = miner_history["profit_prev"]
     current_epoch_idx = n_epochs - 1
     current_epoch_fees = fees_prev_matrix[current_epoch_idx]
     current_epoch_profit = profit_prev_matrix[current_epoch_idx]
-
-    score_eps = 1e-9
+    if current_epoch_idx <= 0:
+        return miners_scores
 
     for entity_idx in range(n_entities):
-        # Guard against numerical dust: require a materially positive score, not just
-        # tiny solver residue in token allocation.
-        if miners_scores["scores"][entity_idx] <= score_eps:
+        # Floor only for miners who lost this epoch.
+        if current_epoch_profit[entity_idx] >= 0:
             continue
-        if miners_scores["tokens"][entity_idx] <= 0:
-            continue
-        if current_epoch_profit[entity_idx] <= 0:
+
+        history_profit = float(np.sum(profit_prev_matrix[:current_epoch_idx, entity_idx]))
+        history_volume = float(np.sum(volume_prev_matrix[:current_epoch_idx, entity_idx]))
+        history_roi = history_profit / history_volume if history_volume > 0 else 0.0
+
+        # Require positive pre-epoch history PnL and ROI.
+        if history_profit <= 0 or history_roi <= 0:
             continue
 
         original_tokens = miners_scores["tokens"][entity_idx]
@@ -1552,14 +1557,14 @@ def apply_miner_positive_score_fee_floor(
 
         if new_tokens > original_tokens:
             print(
-                f"Applying miner positive-score fee floor {entity_idx}: "
+                f"Applying miner history-loss floor {entity_idx}: "
                 f"from {original_tokens:,.2f} -> {new_tokens:,.2f}"
             )
 
     total_tokens = np.sum(miners_scores["tokens"])
     if total_tokens > miner_pool_epoch_budget:
         print(
-            f"Positive-score fee floor: total miner tokens {total_tokens:,.2f} exceeds "
+            f"History-loss fee floor: total miner tokens {total_tokens:,.2f} exceeds "
             f"miner pool budget {miner_pool_epoch_budget:,.2f}. Scaling down proportionally."
         )
         scale_factor = miner_pool_epoch_budget / total_tokens

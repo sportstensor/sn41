@@ -27,9 +27,9 @@ ENABLE_P1_ENTROPY_SMOOTHING = True
 # ~0.01-0.02 materially softens cliff behavior in recent production sims.
 SOFTNESS_TAU = 0.005
 
-# Standalone miner fee-return floor for positive-score epochs.
+# Standalone miner fee-return floor for current-epoch losers with positive history.
 ENABLE_MINER_POSITIVE_SCORE_FEE_FLOOR = True
-# If enabled, miners with positive score receive at least this fraction of current-epoch fees.
+# If enabled, eligible miners receive at least this fraction of current-epoch fees.
 MINER_POSITIVE_SCORE_FEE_FLOOR_MULTIPLIER = 0.7
 
 # Build-up period constants for miner eligibility
