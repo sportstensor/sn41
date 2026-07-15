@@ -834,19 +834,28 @@ def _phase1_routing_signal(p, v_block, roi_block) -> np.ndarray:
     return v_block
 
 def _diversity_volume(p, v_block, v_eff) -> np.ndarray:
-    """Volume basis for per-miner diversity cap."""
+    """Volume basis for per-miner diversity cap.
+
+    Legacy (contributor-off): use epoch volume so cost matches the routing benefit
+    basis (v_block). Protocol contributor: optional block vs eff via rho_volume_basis.
+    """
     if _use_protocol_contributor(p):
         basis = p.get("rho_volume_basis", RHO_VOLUME_BASIS)
         if basis == "block":
             return v_block
-    return v_eff
+        return v_eff
+    return v_block
 
 def _phase1_budget_volume(p, v_block, v_eff) -> np.ndarray:
-    """Volume basis for Phase 1 budget constraint."""
+    """Volume basis for Phase 1 budget constraint.
+
+    Legacy (contributor-off): use epoch volume so budget cost matches the routing
+    benefit basis (v_block). Protocol contributor: blend via phase1_budget_volume_alpha.
+    """
     if _use_protocol_contributor(p):
         alpha = p.get("phase1_budget_volume_alpha", PHASE1_BUDGET_VOLUME_ALPHA)
         return alpha * v_block + (1.0 - alpha) * v_eff
-    return v_eff
+    return v_block
 
 def _credibility_weight(v_memory: np.ndarray) -> np.ndarray:
     """Scale Phase 2 ROI weights by log historical volume relative to the pool median."""
@@ -877,13 +886,15 @@ def _recent_trade_eligibility(epoch_history: Dict[str, Any], lookback_epochs: in
     return np.any(recent_trades > 0, axis=0)
 
 def _max_allocation_gate(p, v_block_raw: np.ndarray) -> np.ndarray:
-    """Per-miner gate ceiling; inactive epochs are dust-only under protocol contributor."""
-    n = v_block_raw.size
-    if _use_protocol_contributor(p):
-        dust_gate = p.get("dust_gate", DUST_GATE)
-        active = _epoch_active(v_block_raw, p["v_min"])
-        return np.where(active, 1.0, dust_gate)
-    return np.ones(n)
+    """Per-miner gate ceiling; inactive epochs are dust-only.
+
+    Required when Phase 1 prices budget/diversity on v_block: zero-volume miners
+    would otherwise be nearly free to open (x→1) and then collect payout from
+    historical v_eff in Phase 2. Same guard the protocol-contributor path used.
+    """
+    dust_gate = p.get("dust_gate", DUST_GATE)
+    active = _epoch_active(v_block_raw, p["v_min"])
+    return np.where(active, 1.0, dust_gate)
 
 def solve_phase1(p, verbose=False):
     """
