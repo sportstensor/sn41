@@ -99,11 +99,11 @@ class Validator:
         # Adds override arguments for network and netuid.
         parser.add_argument('--netuid', type=int, default=1, help="The chain subnet uid.")
         # Adds subtensor specific arguments.
-        bt.subtensor.add_args(parser)
+        bt.Subtensor.add_args(parser)
         # Adds logging specific arguments.
         bt.logging.add_args(parser)
         # Adds wallet specific arguments.
-        bt.wallet.add_args(parser)
+        bt.Wallet.add_args(parser)
         # Adds wandb arguments
         parser.add_argument('--wandb.off', action='store_true', help="Disable wandb logging.")
         # Adds auto-update arguments.
@@ -117,7 +117,7 @@ class Validator:
         # Adds a flag to write trading history to a local JSON file
         parser.add_argument('--write_trading_history', action='store_true', help="Write trading history to local trading_history.json file.")
         # Parse the config.
-        config = bt.config(parser)
+        config = bt.Config(parser)
         # Set up logging directory.
         config.full_path = os.path.expanduser(
             "{}/{}/{}/netuid{}/{}".format(
@@ -135,6 +135,11 @@ class Validator:
     def setup_logging(self):
         # Set up logging.
         bt.logging(config=self.config, logging_dir=self.config.full_path)
+        # substrateinterface calls logging.debug(), which triggers logging.basicConfig()
+        # and attaches a root StreamHandler. Bittensor's logger propagates to root by
+        # default, which duplicates every bt.logging line as "INFO:bittensor:...".
+        import logging
+        logging.getLogger("bittensor").propagate = False
         bt.logging.info(f"Running validator for subnet: {self.config.netuid} on network: {self.config.subtensor.network} with config:")
         bt.logging.info(self.config)
 
@@ -143,15 +148,15 @@ class Validator:
         bt.logging.info("Setting up Bittensor objects.")
 
         # Initialize wallet.
-        self.wallet = bt.wallet(config=self.config)
+        self.wallet = bt.Wallet(config=self.config)
         bt.logging.info(f"Wallet: {self.wallet}")
 
         # Initialize subtensor.
-        self.subtensor = bt.subtensor(config=self.config)
+        self.subtensor = bt.Subtensor(config=self.config)
         bt.logging.info(f"Subtensor: {self.subtensor}")
 
         # Initialize dendrite.
-        self.dendrite = bt.dendrite(wallet=self.wallet)
+        self.dendrite = bt.Dendrite(wallet=self.wallet)
         bt.logging.info(f"Dendrite: {self.dendrite}")
 
         # Initialize metagraph.

@@ -17,7 +17,7 @@ class MetadataManager:
         self.netuid = netuid
         self.network = network
         self.state_file = state_file
-        self.subtensor = bt.subtensor(network=network)
+        self.subtensor = bt.Subtensor(network=network)
         self.metagraph = None
         
         # Configuration
