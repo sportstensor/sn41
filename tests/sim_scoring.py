@@ -563,7 +563,7 @@ def main():
     print("\nRunning scoring algorithm...")
     print("This may take a moment...\n")
 
-    metagraph = bt.subtensor(network="finney").metagraph(41)
+    metagraph = bt.Subtensor(network="finney").metagraph(41)
 
     # Fetch the $TAO price
     tao_price_usd = fetch_tao_price()

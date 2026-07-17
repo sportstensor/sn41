@@ -28,7 +28,7 @@ class Miner:
         # Adds override arguments for network and netuid.
         parser.add_argument('--netuid', type=int, default=1, help="The chain subnet uid.")
         # Adds subtensor specific arguments.
-        bt.subtensor.add_args(parser)
+        bt.Subtensor.add_args(parser)
         # Adds logging specific arguments.
         bt.logging.add_args(parser)
         # Adds wallet specific arguments.
@@ -61,6 +61,10 @@ class Miner:
     def setup_logging(self):
         # Activate Bittensor's logging with the set configurations.
         bt.logging(config=self.config, logging_dir=self.config.full_path)
+        # Prevent duplicate "INFO:bittensor:..." lines if a dependency triggers
+        # logging.basicConfig() (e.g. substrateinterface's logging.debug()).
+        import logging
+        logging.getLogger("bittensor").propagate = False
         bt.logging.info(f"Running miner for subnet: {self.config.netuid} on network: {self.config.subtensor.network} with config:")
         bt.logging.info(self.config)
 
@@ -73,7 +77,7 @@ class Miner:
         bt.logging.info(f"Wallet: {self.wallet}")
 
         # Initialize subtensor.
-        self.subtensor = bt.subtensor(config=self.config)
+        self.subtensor = bt.Subtensor(config=self.config)
         bt.logging.info(f"Subtensor: {self.subtensor}")
 
         # Initialize metagraph.
@@ -166,7 +170,7 @@ class Miner:
         wallet = bt.wallet(name=wallet_name, hotkey=hotkey_name)
         
         bt.logging.info(f"Connecting to network: {network}")
-        subtensor = bt.subtensor(network=network)
+        subtensor = bt.Subtensor(network=network)
         
         # Extract polymarket ID and submit only first 5 characters
         polymarket_id = metadata_dict.get('polymarket_id', '')
@@ -244,7 +248,7 @@ class Miner:
             str: The committed data, or None if not found
         """
         bt.logging.info(f"Retrieving metadata for hotkey: {hotkey_address}")
-        subtensor = bt.subtensor(network=network)
+        subtensor = bt.Subtensor(network=network)
         
         try:
             # Get the UID for this hotkey
@@ -302,7 +306,7 @@ class Miner:
         """
         try:
             wallet = bt.wallet(name=wallet_name, hotkey=hotkey_name)
-            subtensor = bt.subtensor(network=network)
+            subtensor = bt.Subtensor(network=network)
             metagraph = subtensor.metagraph(netuid)
             
             if wallet.hotkey.ss58_address not in metagraph.hotkeys:
