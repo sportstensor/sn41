@@ -1,5 +1,4 @@
 bittensor==10.3.0
-substrate-interface
 wandb
 
 pandas

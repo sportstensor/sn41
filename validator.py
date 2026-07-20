@@ -10,7 +10,7 @@ from typing import Optional, Dict, List
 import requests
 from requests.auth import HTTPBasicAuth
 from subprocess import Popen, PIPE
-from substrateinterface import SubstrateInterface
+from async_substrate_interface.sync_substrate import SubstrateInterface
 import numpy as np
 import random
 
@@ -135,9 +135,8 @@ class Validator:
     def setup_logging(self):
         # Set up logging.
         bt.logging(config=self.config, logging_dir=self.config.full_path)
-        # substrateinterface calls logging.debug(), which triggers logging.basicConfig()
-        # and attaches a root StreamHandler. Bittensor's logger propagates to root by
-        # default, which duplicates every bt.logging line as "INFO:bittensor:...".
+        # Keep bittensor logs on their QueueHandler only (avoid default-format
+        # duplicates if a dependency attaches a root StreamHandler).
         import logging
         logging.getLogger("bittensor").propagate = False
         bt.logging.info(f"Running validator for subnet: {self.config.netuid} on network: {self.config.subtensor.network} with config:")
